@@ -19,6 +19,7 @@ const dateLabel = (value: string) => new Intl.DateTimeFormat('th-TH', { day: 'nu
 const fullDate = new Intl.DateTimeFormat('th-TH', { dateStyle: 'long' }).format(new Date())
 const accountKinds: Record<string, string> = { bank: 'ธนาคาร', e_wallet: 'e-Wallet', cash: 'เงินสด', other: 'อื่น ๆ' }
 const categoryMarks: Record<string, string> = { อาหาร: 'F', เดินทาง: 'T', ช้อปปิ้ง: 'S', ที่อยู่อาศัย: 'H', สุขภาพ: 'W', รายรับ: '↗' }
+const APP_VERSION = 'v1.0.1'
 
 function App() {
   const [user, setUser] = useState<User | null>(null)
@@ -102,7 +103,7 @@ function App() {
       <aside className="sidebar">
         <a className="brand" href="#overview" onClick={(event) => { event.preventDefault(); setPage('overview') }}>
           <span className="brand-symbol"><span /><span /><span /></span>
-          <span className="brand-name">ledgerly<span>.</span></span>
+          <span className="brand-name">ledgerly<span>.</span> <small style={{ fontSize: '0.75rem', opacity: 0.65, fontWeight: 500 }}>{APP_VERSION}</small></span>
         </a>
         <div className="workspace-switch"><span className="workspace-mark">{user.email[0].toUpperCase()}</span><span className="workspace-copy"><b>บัญชีส่วนตัว</b><small>พื้นที่ทำงาน</small></span><ChevronDown size={15} /></div>
         <div className="nav-caption">เมนูหลัก</div>
@@ -131,7 +132,7 @@ function App() {
         {page === 'accounts' && <AccountsPage accounts={dashboard.accounts} onAdd={() => startAccount()} onEdit={startAccount} onDelete={deleteAccount} />}
         {page === 'settings' && <NotificationSettings notify={notify} />}
         {page === 'admin' && user.role === 'admin' && <AdminPage currentUserId={user.id} adminEmail={user.email} notify={notify} />}
-        <footer className="page-footer"><span>Ledgerly</span><span>จัดการทุกบาท อย่างสบายใจ</span><span className="footer-status"><i /> ข้อมูลของคุณถูกแยกเก็บอย่างปลอดภัย</span></footer>
+        <footer className="page-footer"><span>Ledgerly {APP_VERSION}</span><span>จัดการทุกบาท อย่างสบายใจ</span><span className="footer-status"><i /> ข้อมูลของคุณถูกแยกเก็บอย่างปลอดภัย</span></footer>
       </main>
 
       {dialog === 'transaction' && <TransactionDialog accounts={dashboard.accounts} existing={editingTransaction || undefined} onClose={() => { setDialog(null); setEditingTransaction(null) }} onSave={saveTransaction} onUploaded={() => { setDialog(null); notify('อ่านและบันทึกสลิปแล้ว'); reload() }} notify={notify} />}
@@ -198,7 +199,7 @@ function AuthScreen({ onSubmit, loading, notice }: { onSubmit: (email: string, p
     <div className="auth-art"><div className="art-grid" /><div className="art-copy"><div className="brand brand-light"><span className="brand-symbol"><span /><span /><span /></span><span className="brand-name">ledgerly<span>.</span></span></div><p className="art-kicker">YOUR MONEY, IN FOCUS</p><h1>เห็นทุกการใช้จ่าย<br /><em>เข้าใจทุกการเติบโต</em></h1><p className="art-description">ภาพรวมการเงินที่ชัดเจน เริ่มต้นจากทุกวันที่คุณใช้ชีวิต</p><div className="art-illustration"><div className="orbital orbital-one" /><div className="orbital orbital-two" /><div className="chart-glass"><div className="chart-head"><span>ยอดเงินรวม</span><span>THB</span></div><strong>฿ 84,250<span>.00</span></strong><div className="art-chart"><span /><span /><span /><span /><span /><span /><span /><span /><span /><span /><span /><span /></div><div className="chart-foot"><i /> เติบโตต่อเนื่อง <b>+12.8%</b></div></div><div className="float-chip chip-income"><ArrowDownLeft size={16} /><span><small>รายรับเดือนนี้</small><b>+ ฿32,500</b></span></div><div className="float-chip chip-ai"><Sparkles size={15} /><span>AI จัดหมวดหมู่ให้แล้ว</span></div></div><div className="art-footer"><span>01 / 03</span><span className="art-progress"><i /></span><span>การเงินที่เรียบง่าย</span></div></div></div>
     <div className="auth-form-side"><div className="auth-form-wrap">
       <div className="auth-mobile-brand"><span className="brand-symbol"><span /><span /><span /></span><span className="brand-name">ledgerly<span>.</span></span></div>
-      <div className="auth-eyebrow"><span /> FINANCIAL WELLNESS, REIMAGINED</div>
+      <div className="auth-eyebrow"><span /> FINANCIAL WELLNESS, REIMAGINED · {APP_VERSION}</div>
       <h2>{heading}</h2><p className="auth-subtitle">{subtitle}</p>
       <form className="auth-form" onSubmit={submit}>
         <label>อีเมล<div className="field-with-icon"><Mail size={17} /><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" autoComplete="email" required disabled={mode === 'reset'} /></div></label>
