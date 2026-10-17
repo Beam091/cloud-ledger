@@ -8,6 +8,7 @@
     "dev:api": "wrangler dev --config worker/wrangler.toml --ip 0.0.0.0 --port 8787",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
+    "deploy": "npm run build && wrangler deploy --config worker/wrangler.toml",
     "deploy:pages": "npm run build && wrangler pages deploy dist",
     "deploy:api": "wrangler deploy --config worker/wrangler.toml",
     "db:local": "wrangler d1 migrations apply cloud-ledger-db --local --config worker/wrangler.toml",
