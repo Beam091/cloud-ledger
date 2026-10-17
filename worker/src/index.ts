@@ -58,7 +58,7 @@ async function body<T>(request: Request): Promise<T> { return await request.json
 
 async function passwordHash(password: string, salt = crypto.getRandomValues(new Uint8Array(16))) {
   const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits'])
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 210_000, hash: 'SHA-256' }, key, 256)
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 100_000, hash: 'SHA-256' }, key, 256)
   return `${base64url(salt)}.${base64url(new Uint8Array(bits))}`
 }
 
@@ -166,7 +166,10 @@ async function handle(request: Request, env: Env): Promise<Response> {
       await env.DB.prepare("INSERT INTO users (id, email, password_hash, role) SELECT ?, ?, ?, CASE WHEN NOT EXISTS (SELECT 1 FROM users) THEN 'admin' ELSE 'user' END")
         .bind(newId, email, await passwordHash(input.password)).run()
     }
-    catch { return fail('ไม่สามารถสร้างบัญชีได้ กรุณาลองอีกครั้ง', 409) }
+    catch (error) {
+      console.error('Register error:', error)
+      return fail('ไม่สามารถสร้างบัญชีได้ กรุณาลองอีกครั้ง', 409)
+    }
     const userRow = await env.DB.prepare('SELECT id, email, role FROM users WHERE id = ?').bind(newId).first<AuthUser>()
     if (!userRow) return fail('ไม่สามารถสร้างบัญชีได้ กรุณาลองอีกครั้ง', 500)
     const user = userRow
