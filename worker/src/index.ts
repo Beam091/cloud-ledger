@@ -106,6 +106,80 @@ function normalizedAiBaseUrl(value: string) {
   return url.toString().replace(/\/+$/, '')
 }
 
+function normalizeAccountName(value: string) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\s\-_./()]+/g, '')
+    .replace(/[^a-z0-9ก-ฮ]/g, '')
+}
+
+const bankNameAliases: Record<string, string[]> = {
+  'กรุงไทย': ['ktb', 'krungthai', 'kbank', 'krungthai bank'],
+  'กสิกรไทย': ['kasikorn', 'kbankthai', 'kasikornbank'],
+  'ไทยพาณิชย์': ['scb', 'siamcommercialbank', 'thairath'],
+  'ทหารไทย': ['tmb', 'ttb', 'thanachart', 'tmbbank'],
+  'กรุงเทพ': ['bangkokbank', 'bbl'],
+  'ออมสิน': ['gsb', 'governmentsavingbank'],
+  'true money': ['truemoney', 'truemoneywallet', 'truewallet'],
+  'promptpay': ['promptpay', 'พร้อมเพย์'],
+  'cash': ['เงินสด', 'cash'],
+}
+
+function accountAliasVariants(value: string) {
+  const variants = new Set<string>([normalizeAccountName(value)])
+  const normalized = normalizeAccountName(value)
+  for (const [canonical, aliases] of Object.entries(bankNameAliases)) {
+    const normalizedCanonical = normalizeAccountName(canonical)
+    if (!normalizedCanonical) continue
+    if (normalized === normalizedCanonical || aliases.some((alias) => normalizeAccountName(alias) === normalized)) {
+      variants.add(normalizedCanonical)
+      for (const alias of [canonical, ...aliases]) variants.add(normalizeAccountName(alias))
+    }
+  }
+  return [...variants].filter(Boolean)
+}
+
+function scoreAccountMatch(inputName: string, accountName: string) {
+  const input = normalizeAccountName(inputName)
+  const account = normalizeAccountName(accountName)
+  if (!input || !account) return 0
+  if (input === account) return 100
+
+  const inputVariants = accountAliasVariants(inputName)
+  const accountVariants = accountAliasVariants(accountName)
+  if (inputVariants.some((variant) => accountVariants.includes(variant))) return 90
+
+  if (account.includes(input) || input.includes(account)) return 75
+
+  const shortInput = input.slice(0, 3)
+  const shortAccount = account.slice(0, 3)
+  if (shortInput && shortAccount && (account.includes(shortInput) || input.includes(shortAccount))) return 40
+
+  return 0
+}
+
+async function findBestAccountForText(env: Env, userId: string, accountName?: string) {
+  const rows = await env.DB.prepare('SELECT id, name FROM accounts WHERE user_id = ? ORDER BY created_at').bind(userId).all<{ id: string; name: string }>()
+  if (!rows.results.length) return null
+  const fallback = rows.results[0]
+  const target = String(accountName || '').trim()
+  if (!target) return fallback
+
+  let bestMatch = fallback
+  let bestScore = 0
+  for (const account of rows.results) {
+    const score = scoreAccountMatch(target, account.name)
+    if (score > bestScore) {
+      bestScore = score
+      bestMatch = account
+    }
+  }
+  return bestScore >= 40 ? bestMatch : fallback
+}
+
 async function parseWithAI(env: Env, input: string, image?: { mimeType: string; data: string }) {
   const config = await settings(env)
   const apiKey = config.ai_api_key || ''
@@ -312,7 +386,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     if (!input.text?.trim()) return fail('กรุณาพิมพ์รายละเอียดรายการ')
     try {
       const parsed = await parseWithAI(env, input.text)
-      const account = await env.DB.prepare('SELECT id, name FROM accounts WHERE user_id = ? ORDER BY CASE WHEN lower(name) = lower(?) THEN 0 ELSE 1 END, created_at LIMIT 1').bind(user.id, parsed.account_name || '').first<{ id: string; name: string }>()
+      const account = await findBestAccountForText(env, user.id, parsed.account_name)
       if (!account) return fail('กรุณาเพิ่มบัญชีก่อนบันทึกรายการ', 422)
       return json({ parsed, account_id: account.id, account_name: account.name })
     } catch (error) { return fail(error instanceof Error ? error.message : 'AI ประมวลผลไม่สำเร็จ', 502) }
@@ -331,7 +405,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       let binary = ''
       for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
       const parsed = await parseWithAI(env, 'Read the transaction details from this receipt or bank transfer slip.', { mimeType: file.type, data: btoa(binary) })
-      const account = await env.DB.prepare('SELECT id, name FROM accounts WHERE user_id = ? ORDER BY CASE WHEN lower(name) = lower(?) THEN 0 ELSE 1 END, created_at LIMIT 1').bind(user.id, parsed.account_name || '').first<{ id: string; name: string }>()
+      const account = await findBestAccountForText(env, user.id, parsed.account_name)
       if (!account) throw new Error('กรุณาเพิ่มบัญชีก่อนบันทึกรายการ')
       const config = await settings(env)
       const keepImage = Boolean(env.RECEIPTS && config.image_retention_policy !== 'data_only')
