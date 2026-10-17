@@ -1,20 +1,25 @@
-name = "cloud-ledger-api"
+name = "cloud-ledger"
 main = "src/index.ts"
 compatibility_date = "2025-01-15"
 compatibility_flags = ["nodejs_compat"]
 
+[assets]
+directory = "../dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
 [vars]
-APP_ORIGIN = "http://localhost:5173"
+APP_ORIGIN = "*"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "cloud-ledger-db"
-database_id = "9c4e98b5-8bd5-4ded-8c11-0c1267e435e1"
+database_id = "51667351-c3ab-4e89-8914-9175f52e5008"
 migrations_dir = "migrations"
 
-[[r2_buckets]]
-binding = "RECEIPTS"
-bucket_name = "cloud-ledger-receipts"
+# [[r2_buckets]]
+# binding = "RECEIPTS"
+# bucket_name = "cloud-ledger-receipts"
 
 [triggers]
 crons = ["*/15 * * * *"]

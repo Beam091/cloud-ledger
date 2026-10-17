@@ -2,10 +2,11 @@ import { connect } from 'cloudflare:sockets'
 
 interface Env {
   DB: D1Database
-  RECEIPTS: R2Bucket
+  RECEIPTS?: R2Bucket
   JWT_SECRET: string
   ENCRYPTION_KEY: string
   APP_ORIGIN: string
+  ASSETS?: Fetcher
 }
 
 interface AuthUser { id: string; email: string; role: 'admin' | 'user' }
@@ -261,7 +262,9 @@ async function handle(request: Request, env: Env): Promise<Response> {
       env.DB.prepare('DELETE FROM transactions WHERE account_id = ? AND user_id = ?').bind(accountMatch[1], user.id),
       env.DB.prepare('DELETE FROM accounts WHERE id = ? AND user_id = ?').bind(accountMatch[1], user.id),
     ])
-    for (const row of rows.results) if (row.image_key) await env.RECEIPTS.delete(row.image_key)
+    if (env.RECEIPTS) {
+      for (const row of rows.results) if (row.image_key) await env.RECEIPTS.delete(row.image_key)
+    }
     return batch[1]?.meta.changes ? json({ ok: true }) : fail('ไม่พบบัญชี', 404)
   }
 
@@ -297,7 +300,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       env.DB.prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?').bind(old.id, user.id),
       env.DB.prepare('UPDATE accounts SET balance = balance - ? WHERE id = ? AND user_id = ?').bind(signedAmount(old.type, old.amount), old.account_id, user.id),
     ])
-    if (old.image_key) await env.RECEIPTS.delete(old.image_key)
+    if (old.image_key && env.RECEIPTS) await env.RECEIPTS.delete(old.image_key)
     return json({ ok: true })
   }
 
@@ -317,7 +320,9 @@ async function handle(request: Request, env: Env): Promise<Response> {
     if (!(file instanceof File) || !file.type.startsWith('image/')) return fail('กรุณาเลือกไฟล์รูปภาพ')
     if (file.size > 8 * 1024 * 1024) return fail('รูปภาพต้องมีขนาดไม่เกิน 8 MB')
     const key = `${user.id}/${id()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`
-    await env.RECEIPTS.put(key, file.stream(), { httpMetadata: { contentType: file.type } })
+    if (env.RECEIPTS) {
+      await env.RECEIPTS.put(key, file.stream(), { httpMetadata: { contentType: file.type } })
+    }
     try {
       const bytes = new Uint8Array(await file.arrayBuffer())
       let binary = ''
@@ -326,17 +331,18 @@ async function handle(request: Request, env: Env): Promise<Response> {
       const account = await env.DB.prepare('SELECT id, name FROM accounts WHERE user_id = ? ORDER BY CASE WHEN lower(name) = lower(?) THEN 0 ELSE 1 END, created_at LIMIT 1').bind(user.id, parsed.account_name || '').first<{ id: string; name: string }>()
       if (!account) throw new Error('กรุณาเพิ่มบัญชีก่อนบันทึกรายการ')
       const config = await settings(env)
-      const keepImage = config.image_retention_policy !== 'data_only'
+      const keepImage = Boolean(env.RECEIPTS && config.image_retention_policy !== 'data_only')
       const transaction = await createTransaction(env, user, { account_id: account.id, type: parsed.type, amount: parsed.amount, category: parsed.category, description: parsed.description, transaction_date: parsed.transaction_date || new Date().toISOString(), image_url: keepImage ? `/api/receipts/${encodeURIComponent(key)}` : null, image_key: keepImage ? key : null })
-      if (!keepImage) await env.RECEIPTS.delete(key)
+      if (!keepImage && env.RECEIPTS) await env.RECEIPTS.delete(key)
       return json({ transaction, parsed, account_name: account.name }, 201)
     } catch (error) {
-      await env.RECEIPTS.delete(key)
+      if (env.RECEIPTS) await env.RECEIPTS.delete(key)
       return fail(error instanceof Error ? error.message : 'อ่านรูปภาพไม่สำเร็จ', 422)
     }
   }
   const receiptMatch = path.match(/^\/api\/receipts\/(.+)$/)
   if (receiptMatch && method === 'GET') {
+    if (!env.RECEIPTS) return fail('ไม่พบรูปภาพ (ยังไม่ได้เปิดใช้ R2)', 404)
     const key = decodeURIComponent(receiptMatch[1])
     if (!await env.DB.prepare('SELECT id FROM transactions WHERE image_key = ? AND user_id = ?').bind(key, user.id).first()) return fail('ไม่พบรูปภาพ', 404)
     const object = await env.RECEIPTS.get(key)
@@ -567,7 +573,7 @@ async function runScheduled(env: Env) {
   const now = new Date()
   await Promise.allSettled(users.results.filter((row) => cronMatches(row.cron_schedule, now, row.timezone)).map((row) => dispatchNotification(env, row)))
   const config = await settings(env)
-  if (config.image_retention_policy === 'auto_cleanup') {
+  if (config.image_retention_policy === 'auto_cleanup' && env.RECEIPTS) {
     const days = Math.max(1, Number(config.image_retention_days || 90))
     const expired = await env.DB.prepare("SELECT id, user_id, image_key FROM transactions WHERE image_key IS NOT NULL AND transaction_date < datetime('now', ?) ").bind(`-${days} days`).all<{ id: string; user_id: string; image_key: string }>()
     for (const row of expired.results) await env.RECEIPTS.delete(row.image_key)
@@ -577,11 +583,29 @@ async function runScheduled(env: Env) {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const requestOrigin = request.headers.get('origin')
-    if (requestOrigin && requestOrigin !== env.APP_ORIGIN) return fail('Origin not allowed', 403)
-    if (request.method === 'OPTIONS') return cors(new Response(null, { status: 204 }), env.APP_ORIGIN)
-    try { return cors(await handle(request, env), env.APP_ORIGIN) }
-    catch (error) { return cors(fail(error instanceof Error ? error.message : 'เกิดข้อผิดพลาดในระบบ', 500), env.APP_ORIGIN) }
+    const url = new URL(request.url)
+    if (url.pathname.startsWith('/api/')) {
+      const requestOrigin = request.headers.get('origin')
+      const allowedOrigin = requestOrigin && (
+        !env.APP_ORIGIN ||
+        env.APP_ORIGIN === '*' ||
+        requestOrigin === env.APP_ORIGIN ||
+        requestOrigin === url.origin
+      ) ? requestOrigin : (env.APP_ORIGIN || url.origin)
+
+      if (requestOrigin && env.APP_ORIGIN && env.APP_ORIGIN !== '*' && requestOrigin !== env.APP_ORIGIN && requestOrigin !== url.origin) {
+        return fail('Origin not allowed', 403)
+      }
+      if (request.method === 'OPTIONS') return cors(new Response(null, { status: 204 }), allowedOrigin)
+      try { return cors(await handle(request, env), allowedOrigin) }
+      catch (error) { return cors(fail(error instanceof Error ? error.message : 'เกิดข้อผิดพลาดในระบบ', 500), allowedOrigin) }
+    }
+
+    if (env.ASSETS) {
+      return env.ASSETS.fetch(request)
+    }
+
+    return new Response('Not Found', { status: 404 })
   },
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext) { ctx.waitUntil(runScheduled(env)) },
 }
