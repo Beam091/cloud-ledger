@@ -17,9 +17,9 @@ database_name = "cloud-ledger-db"
 database_id = "51667351-c3ab-4e89-8914-9175f52e5008"
 migrations_dir = "migrations"
 
-# [[r2_buckets]]
-# binding = "RECEIPTS"
-# bucket_name = "cloud-ledger-receipts"
+[[r2_buckets]]
+binding = "RECEIPTS"
+bucket_name = "cloud-ledger-receipts"
 
 [triggers]
 crons = ["*/15 * * * *"]
