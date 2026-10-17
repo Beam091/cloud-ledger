@@ -1,0 +1,33 @@
+{
+  "name": "cloud-ledger",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "dev:api": "wrangler dev --config worker/wrangler.toml --ip 0.0.0.0 --port 8787",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "deploy:pages": "npm run build && wrangler pages deploy dist",
+    "deploy:api": "wrangler deploy --config worker/wrangler.toml",
+    "db:local": "wrangler d1 migrations apply cloud-ledger-db --local --config worker/wrangler.toml",
+    "db:remote": "wrangler d1 migrations apply cloud-ledger-db --remote --config worker/wrangler.toml"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^2.15.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tailwindcss": "^4.0.0",
+    "typescript": "~5.7.2",
+    "vite": "^6.0.5",
+    "wrangler": "^3.100.0"
+  }
+}

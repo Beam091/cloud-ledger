@@ -1,0 +1,2 @@
+UPDATE user_notification_settings
+SET gmail_app_password_encrypted = NULL;
