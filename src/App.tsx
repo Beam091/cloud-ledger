@@ -3,7 +3,7 @@ import {
   ArrowRight, Bell, Check, ChevronDown, CircleHelp, Clock3, FileText, LayoutDashboard,
   LoaderCircle, LogOut, ShieldCheck, Wallet,
 } from 'lucide-react'
-import { api, getToken, jsonBody, setToken } from './api'
+import { api, clearLegacyToken, jsonBody } from './api'
 import { APP_VERSION, fullDate } from './lib/format'
 import type { Account, Dashboard, Page, PeriodFilter, Transaction, User } from './types'
 import { AuthScreen } from './components/AuthScreen'
@@ -19,16 +19,19 @@ import { ConfirmDialog, type ConfirmRequest } from './components/ConfirmDialog'
 
 const knownPages: Page[] = ['overview', 'transactions', 'accounts', 'settings', 'admin']
 
-// The active page lives in the URL hash so a browser refresh keeps the current view
-function readHash() {
-  const value = window.location.hash.replace(/^#\/?/, '')
-  return knownPages.includes(value as Page) ? (value as Page) : 'overview'
+// The active page (and overview range) lives in the URL hash so a browser
+// refresh, or a shared link, restores the exact view: #/overview/week etc.
+function readHashState() {
+  const [page = '', param = ''] = window.location.hash.replace(/^#\/?/, '').split('/')
+  const knownPage = knownPages.includes(page as Page) ? (page as Page) : 'overview'
+  const period = param === 'day' || param === 'week' || param === 'month' ? param : null
+  return { page: knownPage, period: knownPage === 'overview' ? period as PeriodFilter | null : null }
 }
 
 function App() {
   const [user, setUser] = useState<User | null>(null)
-  const [booting, setBooting] = useState(Boolean(getToken()))
-  const [page, setPage] = useState<Page>(readHash)
+  const [booting, setBooting] = useState(true)
+  const [page, setPage] = useState<Page>(() => readHashState().page)
   const [dashboard, setDashboard] = useState<Dashboard>({ accounts: [], transactions: [], balance: 0, income: 0, expense: 0, categories: [], trend: [] })
   const [allTransactions, setAllTransactions] = useState<Transaction[]>([])
   const [notice, setNotice] = useState('')
@@ -39,7 +42,7 @@ function App() {
   const [refresh, setRefresh] = useState(0)
   const [query, setQuery] = useState('')
   const [transactionType, setTransactionType] = useState<'all' | 'income' | 'expense'>('all')
-  const [overviewPeriod, setOverviewPeriod] = useState<PeriodFilter>('month')
+  const [overviewPeriod, setOverviewPeriod] = useState<PeriodFilter>(() => readHashState().period || 'month')
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null)
 
   const navigate = (next: Page) => {
@@ -54,7 +57,11 @@ function App() {
   const reload = () => setRefresh((count) => count + 1)
 
   useEffect(() => {
-    const onHash = () => setPage(readHash())
+    const onHash = () => {
+      const { page: next, period } = readHashState()
+      setPage(next)
+      if (period) setOverviewPeriod(period)
+    }
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
   }, [])
@@ -62,8 +69,8 @@ function App() {
   useEffect(() => { if (user && page === 'admin' && user.role !== 'admin') navigate('overview') }, [user, page])
 
   useEffect(() => {
-    if (!getToken()) { setBooting(false); return }
-    api<{ user: User }>('/api/auth/me').then(({ user: current }) => setUser(current)).catch(() => { setToken(null); setUser(null) }).finally(() => setBooting(false))
+    clearLegacyToken()
+    api<{ user: User }>('/api/auth/me').then(({ user: current }) => setUser(current)).catch(() => { setUser(null) }).finally(() => setBooting(false))
   }, [])
 
   useEffect(() => {
@@ -72,19 +79,24 @@ function App() {
     api<Transaction[]>('/api/transactions').then(setAllTransactions).catch(() => undefined)
   }, [user, refresh, overviewPeriod])
 
+  async function logout() {
+    try { await api('/api/auth/logout', { method: 'POST' }) } catch { /* network hiccup: clear the view anyway */ }
+    clearLegacyToken()
+    setUser(null)
+  }
+
   async function authenticate(email: string, password: string, isRegister: boolean) {
     setLoading(true)
     try {
-      const response = await api<{ token: string; user: User }>(isRegister ? '/api/auth/register' : '/api/auth/login', { method: 'POST', body: jsonBody({ email, password }) })
-      setToken(response.token)
+      const response = await api<{ user: User }>(isRegister ? '/api/auth/register' : '/api/auth/login', { method: 'POST', body: jsonBody({ email, password }) })
       setUser(response.user)
-      if (response.user.role !== 'admin' && readHash() === 'admin') navigate('overview')
+      if (response.user.role !== 'admin' && readHashState().page === 'admin') navigate('overview')
       notify(isRegister ? 'สร้างบัญชีเรียบร้อยแล้ว' : 'เข้าสู่ระบบสำเร็จ')
     } catch (error) { notify(error instanceof Error ? error.message : 'เข้าสู่ระบบไม่สำเร็จ') }
     finally { setLoading(false) }
   }
 
-  async function saveTransaction(input: { account_id: string; type: string; amount: number; category: string; description: string; transaction_date?: string }, transactionId?: string) {
+  async function saveTransaction(input: { account_id: string; transfer_account_id?: string; type: string; amount: number; category: string; description: string; transaction_date?: string }, transactionId?: string) {
     await api(transactionId ? `/api/transactions/${transactionId}` : '/api/transactions', { method: transactionId ? 'PATCH' : 'POST', body: jsonBody(input) })
     setEditingTransaction(null)
     setDialog(null)
@@ -144,7 +156,7 @@ function App() {
         </nav>
         <div className="sidebar-bottom">
           <button className="help-panel" onClick={() => setDialog('help')}><span className="help-icon"><CircleHelp size={17} /></span><span className="help-copy"><b>ต้องการความช่วยเหลือ?</b><small>เปิดศูนย์ช่วยเหลือ</small></span><ArrowRight size={15} /></button>
-          <div className="profile"><span className="avatar">{user.email[0].toUpperCase()}</span><span className="profile-copy"><b>{user.email.split('@')[0]}</b><small>{user.role === 'admin' ? 'ผู้ดูแลระบบ' : user.email}</small></span><button className="row-action logout-button" aria-label="ออกจากระบบ" title="ออกจากระบบ" onClick={() => { setToken(null); setUser(null) }}><LogOut size={16} /></button></div>
+          <div className="profile"><span className="avatar">{user.email[0].toUpperCase()}</span><span className="profile-copy"><b>{user.email.split('@')[0]}</b><small>{user.role === 'admin' ? 'ผู้ดูแลระบบ' : user.email}</small></span><button className="row-action logout-button" aria-label="ออกจากระบบ" title="ออกจากระบบ" onClick={logout}><LogOut size={16} /></button></div>
         </div>
       </aside>
 
@@ -154,12 +166,12 @@ function App() {
           <div className="top-actions">
             <span className="today-label"><Clock3 size={14} />{fullDate}</span>
             <button className="icon-button notification-button" aria-label="ตั้งค่าการแจ้งเตือน" title="ตั้งค่าการแจ้งเตือน" onClick={() => navigate('settings')}><Bell size={18} /></button>
-            <button className="icon-button header-logout" aria-label="ออกจากระบบ" title="ออกจากระบบ" onClick={() => { setToken(null); setUser(null) }}><LogOut size={16} /></button>
+            <button className="icon-button header-logout" aria-label="ออกจากระบบ" title="ออกจากระบบ" onClick={logout}><LogOut size={16} /></button>
             <span className="top-avatar">{user.email[0].toUpperCase()}</span>
           </div>
         </header>
 
-        {page === 'overview' && <Overview dashboard={dashboard} period={overviewPeriod} onPeriodChange={setOverviewPeriod} onAdd={startTransaction} onNavigate={navigate} />}
+        {page === 'overview' && <Overview dashboard={dashboard} period={overviewPeriod} onPeriodChange={(period) => { setOverviewPeriod(period); window.location.hash = `#/overview/${period}` }} onAdd={startTransaction} onNavigate={navigate} />}
         {page === 'transactions' && <TransactionsPage transactions={allTransactions} query={query} onQuery={setQuery} typeFilter={transactionType} onTypeFilter={setTransactionType} onAdd={startTransaction} onDelete={deleteTransaction} onEdit={(transaction) => { setEditingTransaction(transaction); setDialog('transaction') }} />}
         {page === 'accounts' && <AccountsPage accounts={dashboard.accounts} onAdd={() => startAccount()} onEdit={startAccount} onDelete={deleteAccount} />}
         {page === 'settings' && <NotificationSettings notify={notify} />}

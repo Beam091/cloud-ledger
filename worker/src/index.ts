@@ -1,11 +1,12 @@
 import { connect } from 'cloudflare:sockets'
 import { base64url, decoder, encoder, fromBase64 } from './lib/encoding'
-import { signedAmount, toBaht, toSatang } from './lib/money'
+import { toBaht, toSatang } from './lib/money'
 import { dateInTz, tzOffsetMinutes } from './lib/timezone'
 import { cronMatches } from './lib/cron'
 import { tokenFor } from './lib/credentials'
 import { decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, verifyResetCode } from './lib/credentials'
 import { accountAliasVariants, normalizeAccountName, scoreAccountMatch } from './lib/accountMatch'
+import { effectsDelta, transactionEffects } from './lib/transactions'
 
 interface Env {
   DB: D1Database
@@ -20,14 +21,35 @@ interface AuthUser { id: string; email: string; role: 'admin' | 'user' }
 interface UploadedFile { type: string; size: number; name: string; stream(): ReadableStream; arrayBuffer(): Promise<ArrayBuffer> }
 interface UserRow extends AuthUser { password_hash: string; is_active: number }
 interface AccountRow { id: string; user_id: string; name: string; type: string; balance: number; currency: string }
-interface TransactionRow { id: string; user_id: string; account_id: string; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string | null; image_url: string | null; image_key: string | null; transaction_date: string }
+interface TransactionRow { id: string; user_id: string; account_id: string; transfer_account_id: string | null; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string | null; image_url: string | null; image_key: string | null; transaction_date: string }
 interface NotificationRow { user_id: string; gmail_enabled: number; gmail_address: string | null; gmail_app_password_encrypted: string | null; telegram_enabled: number; telegram_bot_token: string | null; telegram_chat_id: string | null; discord_enabled: number; discord_webhook_url: string | null; cron_schedule: string; timezone: string; user_email?: string | null }
 
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8' } })
 const fail = (message: string, status = 400) => json({ error: message }, status)
 const id = () => crypto.randomUUID()
+
+const SESSION_COOKIE = 'ledgerly_session'
+const SESSION_MAX_AGE = 60 * 60 * 24 * 14
+
+// The session JWT lives in an httpOnly cookie so page scripts can never read it.
+// The Bearer header is still accepted as a fallback for sessions created before
+// this change (legacy localStorage tokens) until the next login.
+function sessionCookie(request: Request, token: string | null) {
+  const ownOrigin = new URL(request.url).origin
+  const localDev = [ownOrigin, request.headers.get('origin') || ''].some((origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin))
+  const expires = `Max-Age=${token ? SESSION_MAX_AGE : 0}`
+  return `${SESSION_COOKIE}=${token || ''}; Path=/; ${expires}; HttpOnly; Secure; SameSite=${localDev ? 'None' : 'Strict'}`
+}
+
+async function sessionResponse(request: Request, env: Env, user: AuthUser, tokenVersion: number, status = 200) {
+  const response = json({ user }, status)
+  response.headers.append('set-cookie', sessionCookie(request, await tokenFor(user, env.JWT_SECRET, tokenVersion)))
+  return response
+}
+
 async function authenticate(request: Request, env: Env): Promise<AuthUser | null> {
-  const token = request.headers.get('authorization')?.replace(/^Bearer\s+/i, '')
+  const cookieToken = request.headers.get('cookie')?.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]*)`))?.[1]
+  const token = cookieToken || request.headers.get('authorization')?.replace(/^Bearer\s+/i, '') || ''
   if (!token) return null
   try {
     const [header, payload, signature] = token.split('.')
@@ -111,15 +133,20 @@ async function parseWithAI(env: Env, input: string, image?: { mimeType: string; 
 }
 
 async function createTransaction(env: Env, user: AuthUser, data: Omit<TransactionRow, 'id' | 'user_id' | 'image_url' | 'image_key'> & { image_url?: string | null; image_key?: string | null }) {
-  const account = await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(data.account_id, user.id).first()
-  if (!account) throw new Error('Account not found')
   const amountSatang = toSatang(data.amount)
   if (!Number.isInteger(amountSatang) || amountSatang <= 0) throw new Error('จำนวนเงินไม่ถูกต้อง')
+  if (!['income', 'expense', 'transfer'].includes(data.type)) throw new Error('ประเภทรายการไม่ถูกต้อง')
+  if (data.type === 'transfer' && (!data.transfer_account_id || data.transfer_account_id === data.account_id)) throw new Error('กรุณาเลือกบัญชีปลายทางที่ต่างจากบัญชีต้นทาง')
+  const source = await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(data.account_id, user.id).first()
+  if (!source) throw new Error('Account not found')
+  if (data.type === 'transfer' && !await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(data.transfer_account_id!, user.id).first()) throw new Error('Account not found')
   const transactionId = id()
-  const batch = await env.DB.batch([
-    env.DB.prepare('INSERT INTO transactions (id, user_id, account_id, type, amount, category, description, image_url, image_key, transaction_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(transactionId, user.id, data.account_id, data.type, amountSatang, data.category, data.description, data.image_url ?? null, data.image_key ?? null, data.transaction_date || new Date().toISOString()),
-    env.DB.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ? AND user_id = ?').bind(signedAmount(data.type, amountSatang), data.account_id, user.id),
-  ])
+  const statements = [
+    env.DB.prepare('INSERT INTO transactions (id, user_id, account_id, transfer_account_id, type, amount, category, description, image_url, image_key, transaction_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(transactionId, user.id, data.account_id, data.type === 'transfer' ? data.transfer_account_id! : null, data.type, amountSatang, data.category, data.description, data.image_url ?? null, data.image_key ?? null, data.transaction_date || new Date().toISOString()),
+    ...transactionEffects({ ...data, amount: amountSatang }).map((effect) => env.DB.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ? AND user_id = ?').bind(effect.delta, effect.account_id, user.id)),
+  ]
+  const batch = await env.DB.batch(statements)
   if (batch.some((result) => !result.success)) throw new Error('Could not save transaction')
   const row = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(transactionId, user.id).first<{ amount: number } & Record<string, unknown>>()
   return row ? toClientTransaction(row) : row
@@ -130,6 +157,7 @@ function cors(response: Response, origin: string) {
   headers.set('access-control-allow-origin', origin)
   headers.set('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
   headers.set('access-control-allow-headers', 'Authorization,Content-Type')
+  headers.set('access-control-allow-credentials', 'true')
   headers.set('vary', 'Origin')
   return new Response(response.body, { status: response.status, headers })
 }
@@ -139,6 +167,13 @@ async function handle(request: Request, env: Env): Promise<Response> {
   const path = url.pathname.replace(/\/$/, '') || '/'
   const method = request.method
   if (path === '/api/health' && method === 'GET') return json({ ok: true })
+
+  // Public: clearing the session cookie does not require a valid session
+  if (path === '/api/auth/logout' && method === 'POST') {
+    const response = json({ ok: true })
+    response.headers.append('set-cookie', sessionCookie(request, null))
+    return response
+  }
 
   if (path === '/api/auth/register' && method === 'POST') {
     const input = await body<{ email: string; password: string }>(request)
@@ -156,8 +191,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     }
     const userRow = await env.DB.prepare('SELECT id, email, role FROM users WHERE id = ?').bind(newId).first<AuthUser>()
     if (!userRow) return fail('ไม่สามารถสร้างบัญชีได้ กรุณาลองอีกครั้ง', 500)
-    const user = userRow
-    return json({ token: await tokenFor(user, env.JWT_SECRET), user }, 201)
+    return sessionResponse(request, env, userRow, 0, 201)
   }
 
   if (path === '/api/auth/forgot-password' && method === 'POST') {
@@ -209,8 +243,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const row = await env.DB.prepare('SELECT id, email, role, password_hash, is_active, token_version FROM users WHERE email = ?').bind(input.email?.trim().toLowerCase() || '').first<UserRow & { token_version: number }>()
     if (!row || !(await passwordMatches(input.password || '', row.password_hash))) return fail('อีเมลหรือรหัสผ่านไม่ถูกต้อง', 401)
     if (!row.is_active) return fail('บัญชีนี้ถูกปิดใช้งาน กรุณาติดต่อผู้ดูแล', 403)
-    const user = { id: row.id, email: row.email, role: row.role }
-    return json({ token: await tokenFor(user, env.JWT_SECRET, row.token_version), user })
+    return sessionResponse(request, env, { id: row.id, email: row.email, role: row.role }, row.token_version)
   }
 
   const user = await authenticate(request, env)
@@ -234,7 +267,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const startDate = start.toISOString().slice(0, 10)
     const [accounts, recent, totals, categories, trend] = await Promise.all([
       env.DB.prepare('SELECT id, name, type, balance, currency FROM accounts WHERE user_id = ? ORDER BY created_at').bind(user.id).all<AccountRow>(),
-      env.DB.prepare('SELECT t.*, a.name AS account_name FROM transactions t JOIN accounts a ON a.id = t.account_id WHERE t.user_id = ? ORDER BY t.transaction_date DESC LIMIT 8').bind(user.id).all<{ amount: number } & Record<string, unknown>>(),
+      env.DB.prepare('SELECT t.*, a.name AS account_name, ta.name AS transfer_account_name FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN accounts ta ON ta.id = t.transfer_account_id WHERE t.user_id = ? ORDER BY t.transaction_date DESC LIMIT 8').bind(user.id).all<{ amount: number } & Record<string, unknown>>(),
       env.DB.prepare("SELECT type, COALESCE(SUM(amount), 0) AS total FROM transactions WHERE user_id = ? AND date(transaction_date, ?) >= ? AND type IN ('income', 'expense') GROUP BY type").bind(user.id, offsetClause, startDate).all<{ type: string; total: number }>(),
       env.DB.prepare("SELECT category, SUM(amount) AS total FROM transactions WHERE user_id = ? AND type = 'expense' AND date(transaction_date, ?) >= ? GROUP BY category ORDER BY total DESC LIMIT 5").bind(user.id, offsetClause, startDate).all(),
       env.DB.prepare("WITH RECURSIVE days(day) AS (SELECT ? UNION ALL SELECT date(day, '+1 day') FROM days WHERE day < ?) SELECT strftime('%d', days.day) AS day, COALESCE(SUM(t.amount), 0) AS total FROM days LEFT JOIN transactions t ON t.user_id = ? AND t.type = 'expense' AND date(t.transaction_date, ?) = days.day GROUP BY days.day ORDER BY days.day").bind(startDate, endDate, user.id, offsetClause).all<{ day: string; total: number }>(),
@@ -273,9 +306,9 @@ async function handle(request: Request, env: Env): Promise<Response> {
     return result.meta.changes ? json({ ok: true }) : fail('ไม่พบบัญชี', 404)
   }
   if (accountMatch && method === 'DELETE') {
-    const rows = await env.DB.prepare('SELECT image_key FROM transactions WHERE account_id = ? AND user_id = ?').bind(accountMatch[1], user.id).all<{ image_key: string | null }>()
+    const rows = await env.DB.prepare('SELECT image_key FROM transactions WHERE (account_id = ? OR transfer_account_id = ?) AND user_id = ?').bind(accountMatch[1], accountMatch[1], user.id).all<{ image_key: string | null }>()
     const batch = await env.DB.batch([
-      env.DB.prepare('DELETE FROM transactions WHERE account_id = ? AND user_id = ?').bind(accountMatch[1], user.id),
+      env.DB.prepare('DELETE FROM transactions WHERE (account_id = ? OR transfer_account_id = ?) AND user_id = ?').bind(accountMatch[1], accountMatch[1], user.id),
       env.DB.prepare('DELETE FROM accounts WHERE id = ? AND user_id = ?').bind(accountMatch[1], user.id),
     ])
     if (env.RECEIPTS) {
@@ -286,14 +319,14 @@ async function handle(request: Request, env: Env): Promise<Response> {
 
   if (path === '/api/transactions' && method === 'GET') {
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 100), 1), 500)
-    const rows = await env.DB.prepare('SELECT t.*, a.name AS account_name FROM transactions t JOIN accounts a ON a.id = t.account_id WHERE t.user_id = ? ORDER BY t.transaction_date DESC LIMIT ?').bind(user.id, limit).all<{ amount: number } & Record<string, unknown>>()
+    const rows = await env.DB.prepare('SELECT t.*, a.name AS account_name, ta.name AS transfer_account_name FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN accounts ta ON ta.id = t.transfer_account_id WHERE t.user_id = ? ORDER BY t.transaction_date DESC LIMIT ?').bind(user.id, limit).all<{ amount: number } & Record<string, unknown>>()
     return json({ ...rows, results: rows.results.map(toClientTransaction) })
   }
   if (path === '/api/transactions' && method === 'POST') {
-    const input = await body<{ account_id: string; type: 'income' | 'expense'; amount: number; category: string; description?: string; transaction_date?: string }>(request)
-    if (!(input.amount > 0) || !['income', 'expense'].includes(input.type) || !input.category?.trim()) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    const input = await body<{ account_id: string; transfer_account_id?: string; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description?: string; transaction_date?: string }>(request)
+    if (!(input.amount > 0) || !['income', 'expense', 'transfer'].includes(input.type) || !input.category?.trim()) return fail('ข้อมูลรายการไม่ถูกต้อง')
     try {
-      return json(await createTransaction(env, user, { ...input, description: input.description || '', transaction_date: input.transaction_date || new Date().toISOString() }), 201)
+      return json(await createTransaction(env, user, { account_id: input.account_id, transfer_account_id: input.transfer_account_id || null, type: input.type, amount: input.amount, category: input.category, description: input.description || '', transaction_date: input.transaction_date || new Date().toISOString() }), 201)
     } catch (error) {
       console.error('Create transaction failed:', error)
       return fail('ไม่สามารถบันทึกรายการได้ กรุณาตรวจสอบบัญชีที่เลือก', 422)
@@ -305,13 +338,19 @@ async function handle(request: Request, env: Env): Promise<Response> {
     if (!old) return fail('ไม่พบรายการ', 404)
     const input = await body<Partial<TransactionRow>>(request)
     const nextAmount = input.amount === undefined ? Number(old.amount) : toSatang(input.amount)
-    const next = { account_id: input.account_id || old.account_id, type: input.type || old.type, amount: nextAmount, category: input.category || old.category, description: input.description ?? old.description, transaction_date: input.transaction_date || old.transaction_date }
-    if (!(next.amount > 0) || !Number.isInteger(next.amount) || !['income', 'expense'].includes(next.type)) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    const nextType = input.type || old.type
+    const nextTransferAccount = nextType === 'transfer'
+      ? (input.transfer_account_id === undefined ? old.transfer_account_id : (input.transfer_account_id || null))
+      : null
+    const next = { account_id: input.account_id || old.account_id, type: nextType, amount: nextAmount, category: input.category || old.category, description: input.description ?? old.description, transaction_date: input.transaction_date || old.transaction_date, transfer_account_id: nextTransferAccount }
+    if (!(next.amount > 0) || !Number.isInteger(next.amount) || !['income', 'expense', 'transfer'].includes(next.type)) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    if (next.type === 'transfer' && (!next.transfer_account_id || next.transfer_account_id === next.account_id)) return fail('กรุณาเลือกบัญชีปลายทางที่ต่างจากบัญชีต้นทาง')
     if (!await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(next.account_id, user.id).first()) return fail('ไม่พบบัญชี', 404)
+    if (next.type === 'transfer' && !await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(next.transfer_account_id!, user.id).first()) return fail('ไม่พบบัญชีปลายทาง', 404)
+    const balanceUpdates = effectsDelta(transactionEffects(old), transactionEffects(next)).map((effect) => env.DB.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ? AND user_id = ?').bind(effect.delta, effect.account_id, user.id))
     await env.DB.batch([
-      env.DB.prepare('UPDATE accounts SET balance = balance - ? WHERE id = ? AND user_id = ?').bind(signedAmount(old.type, old.amount), old.account_id, user.id),
-      env.DB.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ? AND user_id = ?').bind(signedAmount(next.type, next.amount), next.account_id, user.id),
-      env.DB.prepare('UPDATE transactions SET account_id = ?, type = ?, amount = ?, category = ?, description = ?, transaction_date = ? WHERE id = ? AND user_id = ?').bind(next.account_id, next.type, next.amount, next.category, next.description, next.transaction_date, old.id, user.id),
+      env.DB.prepare('UPDATE transactions SET account_id = ?, transfer_account_id = ?, type = ?, amount = ?, category = ?, description = ?, transaction_date = ? WHERE id = ? AND user_id = ?').bind(next.account_id, nextTransferAccount, next.type, next.amount, next.category, next.description, next.transaction_date, old.id, user.id),
+      ...balanceUpdates,
     ])
     const row = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(old.id, user.id).first<{ amount: number } & Record<string, unknown>>()
     return json(row ? toClientTransaction(row) : row)
@@ -321,7 +360,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     if (!old) return fail('ไม่พบรายการ', 404)
     await env.DB.batch([
       env.DB.prepare('DELETE FROM transactions WHERE id = ? AND user_id = ?').bind(old.id, user.id),
-      env.DB.prepare('UPDATE accounts SET balance = balance - ? WHERE id = ? AND user_id = ?').bind(signedAmount(old.type, old.amount), old.account_id, user.id),
+      ...transactionEffects(old).map((effect) => env.DB.prepare('UPDATE accounts SET balance = balance - ? WHERE id = ? AND user_id = ?').bind(effect.delta, effect.account_id, user.id)),
     ])
     if (old.image_key && env.RECEIPTS) await env.RECEIPTS.delete(old.image_key)
     return json({ ok: true })
@@ -373,7 +412,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       const key = keepImage ? `${user.id}/${id()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}` : null
       if (key && env.RECEIPTS) await env.RECEIPTS.put(key, file.stream(), { httpMetadata: { contentType: file.type } })
       try {
-        const transaction = await createTransaction(env, user, { account_id: accountId, type: type as 'income' | 'expense', amount, category, description, transaction_date: transactionDate ? `${transactionDate}T05:00:00.000Z` : new Date().toISOString(), image_url: key ? `/api/receipts/${encodeURIComponent(key)}` : null, image_key: key })
+        const transaction = await createTransaction(env, user, { account_id: accountId, transfer_account_id: null, type: type as 'income' | 'expense', amount, category, description, transaction_date: transactionDate ? `${transactionDate}T05:00:00.000Z` : new Date().toISOString(), image_url: key ? `/api/receipts/${encodeURIComponent(key)}` : null, image_key: key })
         return json({ transaction }, 201)
       } catch (error) {
         if (key && env.RECEIPTS) await env.RECEIPTS.delete(key)

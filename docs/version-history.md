@@ -1,5 +1,5 @@
 # Ledgerly Version History
-
+/
 ## v1.0.8
 - วันที่: 2026-10-18
 - ปรับปรุง: แยกหน้าเว็บเป็น component ย่อย เปิดหน้าเดิมหลัง refresh ด้วย hash routing และเปลี่ยน confirm ที่ใช้เดิมเป็น dialog ของระบบ
