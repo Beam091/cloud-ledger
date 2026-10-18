@@ -86,6 +86,14 @@ async function decrypt(value: string, secret: string) {
   return decoder.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromBase64(iv) }, key, fromBase64(ciphertext)))
 }
 
+// Values may be stored encrypted (new) or as plain text (legacy rows); try decrypting first and fall back to the raw value
+async function maybeDecrypt(value: string | null, secret: string) {
+  if (!value) return null
+  if (!value.includes('.')) return value
+  try { return await decrypt(value, secret) }
+  catch { return value }
+}
+
 async function resetCodeDigest(userId: string, code: string, secret: string) {
   const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
   const digest = await crypto.subtle.sign('HMAC', key, encoder.encode(`${userId}:${code}`))
@@ -513,11 +521,22 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const timezone = input.timezone || previous?.timezone || 'Asia/Bangkok'
     try { new Intl.DateTimeFormat('en-US', { timeZone: timezone }) }
     catch { return fail('เขตเวลาไม่ถูกต้อง') }
+    let telegramToken: string | null
+    let discordWebhook: string | null
+    try {
+      if (input.telegram_bot_token !== undefined) telegramToken = input.telegram_bot_token?.trim() ? await encrypt(input.telegram_bot_token.trim(), env.ENCRYPTION_KEY) : null
+      else telegramToken = previous?.telegram_bot_token ?? null
+      if (input.discord_webhook_url !== undefined) discordWebhook = input.discord_webhook_url?.trim() ? await encrypt(input.discord_webhook_url.trim(), env.ENCRYPTION_KEY) : null
+      else discordWebhook = previous?.discord_webhook_url ?? null
+    } catch (error) {
+      console.error('Notification credential encryption failed:', error)
+      return fail('ไม่สามารถบันทึกข้อมูลการแจ้งเตือนได้ กรุณาตรวจ ENCRYPTION_KEY ของระบบ', 500)
+    }
     const recipientEmail = user.email.trim().toLowerCase()
     await env.DB.prepare(`INSERT INTO user_notification_settings (user_id, gmail_enabled, gmail_address, gmail_app_password_encrypted, telegram_enabled, telegram_bot_token, telegram_chat_id, discord_enabled, discord_webhook_url, cron_schedule, timezone, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(user_id) DO UPDATE SET gmail_enabled=excluded.gmail_enabled, gmail_address=excluded.gmail_address, gmail_app_password_encrypted=excluded.gmail_app_password_encrypted, telegram_enabled=excluded.telegram_enabled, telegram_bot_token=excluded.telegram_bot_token, telegram_chat_id=excluded.telegram_chat_id, discord_enabled=excluded.discord_enabled, discord_webhook_url=excluded.discord_webhook_url, cron_schedule=excluded.cron_schedule, timezone=excluded.timezone, updated_at=CURRENT_TIMESTAMP`)
-      .bind(user.id, Number(Boolean(input.gmail_enabled)), recipientEmail, null, Number(Boolean(input.telegram_enabled)), input.telegram_bot_token || previous?.telegram_bot_token || null, input.telegram_chat_id?.trim() || previous?.telegram_chat_id || null, Number(Boolean(input.discord_enabled)), input.discord_webhook_url || previous?.discord_webhook_url || null, schedule, timezone).run()
+      .bind(user.id, Number(Boolean(input.gmail_enabled)), recipientEmail, null, Number(Boolean(input.telegram_enabled)), telegramToken, input.telegram_chat_id?.trim() || previous?.telegram_chat_id || null, Number(Boolean(input.discord_enabled)), discordWebhook, schedule, timezone).run()
     return json({ ok: true })
   }
 
@@ -700,9 +719,11 @@ async function dispatchNotification(env: Env, row: NotificationRow) {
   const period = scheduleType === 'weekly' ? `${formatDate(startDate)} - ${formatDate(endDate)}` : scheduleType === 'monthly' ? `${formatDate(startDate)} - ${formatDate(endDate)}` : formatDate(endDate)
   const label = scheduleType === 'daily' ? 'ประจำวัน' : scheduleType === 'weekly' ? 'ประจำสัปดาห์' : 'ประจำเดือน'
   const summary = `สรุปรายรับรายจ่าย${label} ${period}\nรายรับ ${Number(values.income || 0).toLocaleString('th-TH')} บาท\nรายจ่าย ${Number(values.expense || 0).toLocaleString('th-TH')} บาท`
+  const telegramToken = await maybeDecrypt(row.telegram_bot_token, env.ENCRYPTION_KEY)
+  const discordWebhookUrl = await maybeDecrypt(row.discord_webhook_url, env.ENCRYPTION_KEY)
   const tasks: Promise<unknown>[] = []
-  if (row.telegram_enabled && row.telegram_bot_token && row.telegram_chat_id) tasks.push(fetch(`https://api.telegram.org/bot${row.telegram_bot_token}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: row.telegram_chat_id, text: summary }) }).then((response) => { if (!response.ok) throw new Error(`Telegram HTTP ${response.status}`) }))
-  if (row.discord_enabled && row.discord_webhook_url) tasks.push(fetch(row.discord_webhook_url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ embeds: [{ title: 'สรุปการเงิน', description: summary, color: 3682504 }] }) }).then((response) => { if (!response.ok) throw new Error(`Discord HTTP ${response.status}`) }))
+  if (row.telegram_enabled && telegramToken && row.telegram_chat_id) tasks.push(fetch(`https://api.telegram.org/bot${telegramToken}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: row.telegram_chat_id, text: summary }) }).then((response) => { if (!response.ok) throw new Error(`Telegram HTTP ${response.status}`) }))
+  if (row.discord_enabled && discordWebhookUrl) tasks.push(fetch(discordWebhookUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ embeds: [{ title: 'สรุปการเงิน', description: summary, color: 3682504 }] }) }).then((response) => { if (!response.ok) throw new Error(`Discord HTTP ${response.status}`) }))
   if (row.gmail_enabled && (row.gmail_address || row.user_email)) tasks.push(emailSummary(env, row, summary, config))
   const outcomes = await Promise.allSettled(tasks)
   for (const outcome of outcomes) if (outcome.status === 'rejected') console.error('Notification delivery failed:', outcome.reason)
