@@ -10,6 +10,7 @@ interface Env {
 }
 
 interface AuthUser { id: string; email: string; role: 'admin' | 'user' }
+interface UploadedFile { type: string; size: number; name: string; stream(): ReadableStream; arrayBuffer(): Promise<ArrayBuffer> }
 interface UserRow extends AuthUser { password_hash: string; is_active: number }
 interface AccountRow { id: string; user_id: string; name: string; type: string; balance: number; currency: string }
 interface TransactionRow { id: string; user_id: string; account_id: string; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string | null; image_url: string | null; image_key: string | null; transaction_date: string }
@@ -213,6 +214,22 @@ async function parseWithAI(env: Env, input: string, image?: { mimeType: string; 
 
 function signedAmount(type: string, amount: number) { return type === 'income' ? amount : -amount }
 
+function dateInTz(timezone: string, date = new Date()) {
+  try {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date)
+  } catch { return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date) }
+}
+
+function tzOffsetMinutes(timezone: string) {
+  try {
+    const name = new Intl.DateTimeFormat('en-US', { timeZone: timezone, timeZoneName: 'longOffset' }).formatToParts(new Date()).find((part) => part.type === 'timeZoneName')?.value || ''
+    const match = name.match(/GMT([+-])(\d{2}):(\d{2})/)
+    if (!match) return 420
+    const sign = match[1] === '-' ? -1 : 1
+    return sign * (Number(match[2]) * 60 + Number(match[3]))
+  } catch { return 420 }
+}
+
 async function createTransaction(env: Env, user: AuthUser, data: Omit<TransactionRow, 'id' | 'user_id' | 'image_url' | 'image_key'> & { image_url?: string | null; image_key?: string | null }) {
   const account = await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(data.account_id, user.id).first()
   if (!account) throw new Error('Account not found')
@@ -318,15 +335,29 @@ async function handle(request: Request, env: Env): Promise<Response> {
   if (path === '/api/auth/me' && method === 'GET') return json({ user })
 
   if (path === '/api/dashboard' && method === 'GET') {
-    const [accounts, recent, month, categories, trend] = await Promise.all([
+    const period = ['day', 'week', 'month'].includes(url.searchParams.get('period') || '') ? (url.searchParams.get('period') as 'day' | 'week' | 'month') : 'month'
+    const notificationRow = await env.DB.prepare('SELECT timezone FROM user_notification_settings WHERE user_id = ?').bind(user.id).first<{ timezone: string }>()
+    const timezone = notificationRow?.timezone || 'Asia/Bangkok'
+    const offsetClause = `+${tzOffsetMinutes(timezone)} minutes`
+    const endDate = dateInTz(timezone)
+    const start = new Date(`${endDate}T00:00:00Z`)
+    if (period === 'day') {
+      // start of day
+    } else if (period === 'week') {
+      start.setUTCDate(start.getUTCDate() - 6)
+    } else {
+      start.setUTCDate(1)
+    }
+    const startDate = start.toISOString().slice(0, 10)
+    const [accounts, recent, totals, categories, trend] = await Promise.all([
       env.DB.prepare('SELECT id, name, type, balance, currency FROM accounts WHERE user_id = ? ORDER BY created_at').bind(user.id).all<AccountRow>(),
       env.DB.prepare('SELECT t.*, a.name AS account_name FROM transactions t JOIN accounts a ON a.id = t.account_id WHERE t.user_id = ? ORDER BY t.transaction_date DESC LIMIT 8').bind(user.id).all(),
-      env.DB.prepare("SELECT type, COALESCE(SUM(amount), 0) AS total FROM transactions WHERE user_id = ? AND date(transaction_date, '+7 hours') >= date('now', '+7 hours', 'start of month') AND type IN ('income', 'expense') GROUP BY type").bind(user.id).all<{ type: string; total: number }>(),
-      env.DB.prepare("SELECT category, SUM(amount) AS total FROM transactions WHERE user_id = ? AND type = 'expense' AND date(transaction_date, '+7 hours') >= date('now', '+7 hours', 'start of month') GROUP BY category ORDER BY total DESC LIMIT 5").bind(user.id).all(),
-      env.DB.prepare("WITH RECURSIVE days(day) AS (SELECT date('now', '+7 hours', 'start of month') UNION ALL SELECT date(day, '+1 day') FROM days WHERE day < date('now', '+7 hours', 'start of month', '+1 month', '-1 day')) SELECT strftime('%d', days.day) AS day, COALESCE(SUM(t.amount), 0) AS total FROM days LEFT JOIN transactions t ON t.user_id = ? AND t.type = 'expense' AND date(t.transaction_date, '+7 hours') = days.day GROUP BY days.day ORDER BY days.day").bind(user.id).all<{ day: string; total: number }>(),
+      env.DB.prepare("SELECT type, COALESCE(SUM(amount), 0) AS total FROM transactions WHERE user_id = ? AND date(transaction_date, ?) >= ? AND type IN ('income', 'expense') GROUP BY type").bind(user.id, offsetClause, startDate).all<{ type: string; total: number }>(),
+      env.DB.prepare("SELECT category, SUM(amount) AS total FROM transactions WHERE user_id = ? AND type = 'expense' AND date(transaction_date, ?) >= ? GROUP BY category ORDER BY total DESC LIMIT 5").bind(user.id, offsetClause, startDate).all(),
+      env.DB.prepare("WITH RECURSIVE days(day) AS (SELECT ? UNION ALL SELECT date(day, '+1 day') FROM days WHERE day < ?) SELECT strftime('%d', days.day) AS day, COALESCE(SUM(t.amount), 0) AS total FROM days LEFT JOIN transactions t ON t.user_id = ? AND t.type = 'expense' AND date(t.transaction_date, ?) = days.day GROUP BY days.day ORDER BY days.day").bind(startDate, endDate, user.id, offsetClause).all<{ day: string; total: number }>(),
     ])
-    const totals = Object.fromEntries(month.results.map((row) => [row.type, row.total]))
-    return json({ accounts: accounts.results, transactions: recent.results, income: totals.income || 0, expense: totals.expense || 0, categories: categories.results, trend: trend.results, balance: accounts.results.reduce((sum, account) => sum + account.balance, 0) })
+    const totalsByType = Object.fromEntries(totals.results.map((row) => [row.type, row.total]))
+    return json({ accounts: accounts.results, transactions: recent.results, income: totalsByType.income || 0, expense: totalsByType.expense || 0, categories: categories.results, trend: trend.results, period, balance: accounts.results.reduce((sum, account) => sum + account.balance, 0) })
   }
 
   if (path === '/api/accounts' && method === 'GET') return json(await env.DB.prepare('SELECT * FROM accounts WHERE user_id = ? ORDER BY created_at').bind(user.id).all())
@@ -371,7 +402,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     if (!old) return fail('ไม่พบรายการ', 404)
     const input = await body<Partial<TransactionRow>>(request)
     const next = { account_id: input.account_id || old.account_id, type: input.type || old.type, amount: input.amount ?? old.amount, category: input.category || old.category, description: input.description ?? old.description, transaction_date: input.transaction_date || old.transaction_date }
-    if (!(next.amount > 0) || !['income', 'expense', 'transfer'].includes(next.type)) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    if (!(next.amount > 0) || !['income', 'expense'].includes(next.type)) return fail('ข้อมูลรายการไม่ถูกต้อง')
     if (!await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(next.account_id, user.id).first()) return fail('ไม่พบบัญชี', 404)
     await env.DB.batch([
       env.DB.prepare('UPDATE accounts SET balance = balance - ? WHERE id = ? AND user_id = ?').bind(signedAmount(old.type, old.amount), old.account_id, user.id),
@@ -405,8 +436,10 @@ async function handle(request: Request, env: Env): Promise<Response> {
   if ((path === '/api/ai/slip/preview' || path === '/api/ai/slip') && method === 'POST') {
     const previewOnly = path.endsWith('/preview')
     const form = await request.formData()
-    const file = form.get('file')
-    if (!(file instanceof File) || !file.type.startsWith('image/')) return fail('กรุณาเลือกไฟล์รูปภาพ')
+    const upload = form.get('file')
+    if (!upload || typeof upload === 'string') return fail('กรุณาเลือกไฟล์รูปภาพ')
+    const file = upload as unknown as UploadedFile
+    if (!file.type.startsWith('image/')) return fail('กรุณาเลือกไฟล์รูปภาพ')
     if (file.size > 8 * 1024 * 1024) return fail('รูปภาพต้องมีขนาดไม่เกิน 8 MB')
     try {
       let parsed: Awaited<ReturnType<typeof parseWithAI>> | undefined
@@ -435,7 +468,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       const key = keepImage ? `${user.id}/${id()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}` : null
       if (key && env.RECEIPTS) await env.RECEIPTS.put(key, file.stream(), { httpMetadata: { contentType: file.type } })
       try {
-        const transaction = await createTransaction(env, user, { account_id: accountId, type, amount, category, description, transaction_date: transactionDate ? `${transactionDate}T05:00:00.000Z` : new Date().toISOString(), image_url: key ? `/api/receipts/${encodeURIComponent(key)}` : null, image_key: key })
+        const transaction = await createTransaction(env, user, { account_id: accountId, type: type as 'income' | 'expense', amount, category, description, transaction_date: transactionDate ? `${transactionDate}T05:00:00.000Z` : new Date().toISOString(), image_url: key ? `/api/receipts/${encodeURIComponent(key)}` : null, image_key: key })
         return json({ transaction }, 201)
       } catch (error) {
         if (key && env.RECEIPTS) await env.RECEIPTS.delete(key)
@@ -481,7 +514,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     await env.DB.prepare(`INSERT INTO user_notification_settings (user_id, gmail_enabled, gmail_address, gmail_app_password_encrypted, telegram_enabled, telegram_bot_token, telegram_chat_id, discord_enabled, discord_webhook_url, cron_schedule, timezone, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(user_id) DO UPDATE SET gmail_enabled=excluded.gmail_enabled, gmail_address=excluded.gmail_address, gmail_app_password_encrypted=excluded.gmail_app_password_encrypted, telegram_enabled=excluded.telegram_enabled, telegram_bot_token=excluded.telegram_bot_token, telegram_chat_id=excluded.telegram_chat_id, discord_enabled=excluded.discord_enabled, discord_webhook_url=excluded.discord_webhook_url, cron_schedule=excluded.cron_schedule, timezone=excluded.timezone, updated_at=CURRENT_TIMESTAMP`)
-      .bind(user.id, Number(Boolean(input.gmail_enabled)), recipientEmail, null, Number(Boolean(input.telegram_enabled)), input.telegram_bot_token || previous?.telegram_bot_token || null, input.telegram_chat_id || null, Number(Boolean(input.discord_enabled)), input.discord_webhook_url || previous?.discord_webhook_url || null, schedule, timezone).run()
+      .bind(user.id, Number(Boolean(input.gmail_enabled)), recipientEmail, null, Number(Boolean(input.telegram_enabled)), input.telegram_bot_token || previous?.telegram_bot_token || null, input.telegram_chat_id?.trim() || previous?.telegram_chat_id || null, Number(Boolean(input.discord_enabled)), input.discord_webhook_url || previous?.discord_webhook_url || null, schedule, timezone).run()
     return json({ ok: true })
   }
 
@@ -658,7 +691,7 @@ async function dispatchNotification(env: Env, row: NotificationRow) {
     start.setUTCDate(1)
   }
   const startDate = start.toISOString().slice(0, 10)
-  const totals = await env.DB.prepare("SELECT type, SUM(amount) AS total FROM transactions WHERE user_id = ? AND date(transaction_date, '+7 hours') BETWEEN ? AND ? GROUP BY type").bind(row.user_id, startDate, endDate).all<{ type: string; total: number }>()
+  const totals = await env.DB.prepare('SELECT type, SUM(amount) AS total FROM transactions WHERE user_id = ? AND date(transaction_date, ?) BETWEEN ? AND ? GROUP BY type').bind(row.user_id, `+${tzOffsetMinutes(row.timezone)} minutes`, startDate, endDate).all<{ type: string; total: number }>()
   const values = Object.fromEntries(totals.results.map((item) => [item.type, item.total]))
   const formatDate = (value: string) => new Intl.DateTimeFormat('th-TH', { timeZone: row.timezone || 'Asia/Bangkok', day: 'numeric', month: 'short', year: 'numeric' }).format(new Date(`${value}T12:00:00Z`))
   const period = scheduleType === 'weekly' ? `${formatDate(startDate)} - ${formatDate(endDate)}` : scheduleType === 'monthly' ? `${formatDate(startDate)} - ${formatDate(endDate)}` : formatDate(endDate)
