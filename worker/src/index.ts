@@ -55,7 +55,10 @@ async function authenticate(request: Request, env: Env): Promise<AuthUser | null
   } catch { return null }
 }
 
-async function body<T>(request: Request): Promise<T> { return await request.json() as T }
+async function body<T>(request: Request): Promise<T> {
+  try { return await request.json() as T }
+  catch { return {} as T }
+}
 
 async function passwordHash(password: string, salt = crypto.getRandomValues(new Uint8Array(16))) {
   const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits'])
@@ -323,7 +326,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
 
   if (path === '/api/auth/login' && method === 'POST') {
     const input = await body<{ email: string; password: string }>(request)
-    const row = await env.DB.prepare('SELECT id, email, role, password_hash, is_active, token_version FROM users WHERE email = ?').bind(input.email?.trim().toLowerCase()).first<UserRow & { token_version: number }>()
+    const row = await env.DB.prepare('SELECT id, email, role, password_hash, is_active, token_version FROM users WHERE email = ?').bind(input.email?.trim().toLowerCase() || '').first<UserRow & { token_version: number }>()
     if (!row || !(await passwordMatches(input.password || '', row.password_hash))) return fail('อีเมลหรือรหัสผ่านไม่ถูกต้อง', 401)
     if (!row.is_active) return fail('บัญชีนี้ถูกปิดใช้งาน กรุณาติดต่อผู้ดูแล', 403)
     const user = { id: row.id, email: row.email, role: row.role }
@@ -724,14 +727,17 @@ export default {
     const url = new URL(request.url)
     if (url.pathname.startsWith('/api/')) {
       const requestOrigin = request.headers.get('origin')
+      // Always allow browser dev servers (localhost) so local development keeps working
+      const localOrigin = Boolean(requestOrigin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(requestOrigin))
       const allowedOrigin = requestOrigin && (
+        localOrigin ||
         !env.APP_ORIGIN ||
         env.APP_ORIGIN === '*' ||
         requestOrigin === env.APP_ORIGIN ||
         requestOrigin === url.origin
       ) ? requestOrigin : (env.APP_ORIGIN || url.origin)
 
-      if (requestOrigin && env.APP_ORIGIN && env.APP_ORIGIN !== '*' && requestOrigin !== env.APP_ORIGIN && requestOrigin !== url.origin) {
+      if (requestOrigin && !localOrigin && env.APP_ORIGIN && env.APP_ORIGIN !== '*' && requestOrigin !== env.APP_ORIGIN && requestOrigin !== url.origin) {
         return fail('Origin not allowed', 403)
       }
       if (request.method === 'OPTIONS') return cors(new Response(null, { status: 204 }), allowedOrigin)

@@ -9,7 +9,7 @@ binding = "ASSETS"
 not_found_handling = "single-page-application"
 
 [vars]
-APP_ORIGIN = "*"
+APP_ORIGIN = "https://money.aury.win"
 
 [[d1_databases]]
 binding = "DB"
