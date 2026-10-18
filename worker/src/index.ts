@@ -124,6 +124,7 @@ const bankNameAliases: Record<string, string[]> = {
   'กรุงเทพ': ['bangkokbank', 'bbl'],
   'ออมสิน': ['gsb', 'governmentsavingbank'],
   'true money': ['truemoney', 'truemoneywallet', 'truewallet'],
+  'e-wallet': ['ewallet', 'wallet', 'วอลเล็ต', 'วอเลต', 'วอลเล็ท', 'กระเป๋าเงินออนไลน์'],
   'promptpay': ['promptpay', 'พร้อมเพย์'],
   'cash': ['เงินสด', 'cash'],
 }
@@ -161,10 +162,19 @@ function scoreAccountMatch(inputName: string, accountName: string) {
   return 0
 }
 
-async function findBestAccountForText(env: Env, userId: string, accountName?: string) {
-  const rows = await env.DB.prepare('SELECT id, name FROM accounts WHERE user_id = ? ORDER BY created_at').bind(userId).all<{ id: string; name: string }>()
+async function findBestAccountForText(env: Env, userId: string, accountName?: string, inputText = '') {
+  const rows = await env.DB.prepare('SELECT id, name, type FROM accounts WHERE user_id = ? ORDER BY created_at').bind(userId).all<{ id: string; name: string; type: string }>()
   if (!rows.results.length) return null
   const fallback = rows.results[0]
+  const normalizedText = normalizeAccountName(inputText)
+  const explicitlyNamed = rows.results.filter((account) => accountAliasVariants(account.name).some((variant) => variant.length >= 3 && normalizedText.includes(variant)))
+  if (explicitlyNamed.length === 1) return explicitlyNamed[0]
+  const accountTypeKeywords: Record<string, string[]> = {
+    e_wallet: ['wallet', 'e-wallet', 'วอลเล็ต', 'วอเลต', 'วอลเล็ท', 'กระเป๋าเงินออนไลน์'],
+    cash: ['เงินสด', 'cash'],
+  }
+  const typedMatches = rows.results.filter((account) => accountTypeKeywords[account.type]?.some((keyword) => normalizedText.includes(normalizeAccountName(keyword))))
+  if (typedMatches.length === 1) return typedMatches[0]
   const target = String(accountName || '').trim()
   if (!target) return fallback
 
@@ -180,13 +190,13 @@ async function findBestAccountForText(env: Env, userId: string, accountName?: st
   return bestScore >= 40 ? bestMatch : fallback
 }
 
-async function parseWithAI(env: Env, input: string, image?: { mimeType: string; data: string }) {
+async function parseWithAI(env: Env, input: string, image?: { mimeType: string; data: string }, accountNames: string[] = []) {
   const config = await settings(env)
   const apiKey = config.ai_api_key || ''
   if (!apiKey) throw new Error('AI API key is not configured by the administrator')
   const baseUrl = normalizedAiBaseUrl(config.ai_base_url || 'https://generativelanguage.googleapis.com/v1beta/openai')
   const model = config.ai_model || 'gemini-3.5-flash-lite'
-  const prompt = `Extract one personal finance transaction. Return a JSON object with amount (number), type (income or expense), category (string), account_name (string), description (string), transaction_date (ISO 8601 string). Use an empty string for an unknown account/date and infer conservatively. Input: ${input}`
+  const prompt = `Extract one personal finance transaction. Return a JSON object with amount (number), type (income or expense), category (string), account_name (string), description (string), transaction_date (ISO 8601 string). Read the amount exactly as written or shown; do not add or remove zeros. Infer income/expense from the wording and infer conservatively. Choose account_name only from this user's accounts, returning the exact account name; use an empty string if unclear: ${JSON.stringify(accountNames)}. Match Thai phrases such as wallet/วอเลต to e-Wallet accounts and เงินสด to cash accounts. Input: ${input}`
   const content: Array<Record<string, unknown>> = [{ type: 'text', text: prompt }]
   if (image) content.push({ type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.data}` } })
   const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -385,35 +395,53 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const input = await body<{ text: string }>(request)
     if (!input.text?.trim()) return fail('กรุณาพิมพ์รายละเอียดรายการ')
     try {
-      const parsed = await parseWithAI(env, input.text)
-      const account = await findBestAccountForText(env, user.id, parsed.account_name)
+      const accounts = await env.DB.prepare('SELECT name FROM accounts WHERE user_id = ? ORDER BY created_at').bind(user.id).all<{ name: string }>()
+      const parsed = await parseWithAI(env, input.text, undefined, accounts.results.map((account) => account.name))
+      const account = await findBestAccountForText(env, user.id, parsed.account_name, input.text)
       if (!account) return fail('กรุณาเพิ่มบัญชีก่อนบันทึกรายการ', 422)
       return json({ parsed, account_id: account.id, account_name: account.name })
     } catch (error) { return fail(error instanceof Error ? error.message : 'AI ประมวลผลไม่สำเร็จ', 502) }
   }
-  if (path === '/api/ai/slip' && method === 'POST') {
+  if ((path === '/api/ai/slip/preview' || path === '/api/ai/slip') && method === 'POST') {
+    const previewOnly = path.endsWith('/preview')
     const form = await request.formData()
     const file = form.get('file')
     if (!(file instanceof File) || !file.type.startsWith('image/')) return fail('กรุณาเลือกไฟล์รูปภาพ')
     if (file.size > 8 * 1024 * 1024) return fail('รูปภาพต้องมีขนาดไม่เกิน 8 MB')
-    const key = `${user.id}/${id()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`
-    if (env.RECEIPTS) {
-      await env.RECEIPTS.put(key, file.stream(), { httpMetadata: { contentType: file.type } })
-    }
     try {
-      const bytes = new Uint8Array(await file.arrayBuffer())
-      let binary = ''
-      for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
-      const parsed = await parseWithAI(env, 'Read the transaction details from this receipt or bank transfer slip.', { mimeType: file.type, data: btoa(binary) })
-      const account = await findBestAccountForText(env, user.id, parsed.account_name)
-      if (!account) throw new Error('กรุณาเพิ่มบัญชีก่อนบันทึกรายการ')
+      let parsed: Awaited<ReturnType<typeof parseWithAI>> | undefined
+      let account: Awaited<ReturnType<typeof findBestAccountForText>>
+      if (previewOnly) {
+        const accounts = await env.DB.prepare('SELECT name FROM accounts WHERE user_id = ? ORDER BY created_at').bind(user.id).all<{ name: string }>()
+        const bytes = new Uint8Array(await file.arrayBuffer())
+        let binary = ''
+        for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
+        parsed = await parseWithAI(env, 'Read the transaction details from this receipt or bank transfer slip. Read every digit carefully and return the amount exactly as shown.', { mimeType: file.type, data: btoa(binary) }, accounts.results.map((item) => item.name))
+        account = await findBestAccountForText(env, user.id, parsed.account_name)
+        if (!account) throw new Error('กรุณาเพิ่มบัญชีก่อนบันทึกรายการ')
+        return json({ parsed, account_id: account.id, account_name: account.name })
+      }
+
+      const accountId = String(form.get('account_id') || '')
+      const type = String(form.get('type') || '')
+      const amount = Number(form.get('amount'))
+      const category = String(form.get('category') || '').trim()
+      const description = String(form.get('description') || '').trim()
+      const transactionDate = String(form.get('transaction_date') || '')
+      if (!(amount > 0) || !Number.isFinite(amount) || !['income', 'expense'].includes(type) || !category) return fail('กรุณาตรวจสอบประเภท จำนวนเงิน และหมวดหมู่ก่อนบันทึก')
+      if (transactionDate && !/^\d{4}-\d{2}-\d{2}$/.test(transactionDate)) return fail('วันที่รายการไม่ถูกต้อง')
       const config = await settings(env)
       const keepImage = Boolean(env.RECEIPTS && config.image_retention_policy !== 'data_only')
-      const transaction = await createTransaction(env, user, { account_id: account.id, type: parsed.type, amount: parsed.amount, category: parsed.category, description: parsed.description, transaction_date: parsed.transaction_date || new Date().toISOString(), image_url: keepImage ? `/api/receipts/${encodeURIComponent(key)}` : null, image_key: keepImage ? key : null })
-      if (!keepImage && env.RECEIPTS) await env.RECEIPTS.delete(key)
-      return json({ transaction, parsed, account_name: account.name }, 201)
+      const key = keepImage ? `${user.id}/${id()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}` : null
+      if (key && env.RECEIPTS) await env.RECEIPTS.put(key, file.stream(), { httpMetadata: { contentType: file.type } })
+      try {
+        const transaction = await createTransaction(env, user, { account_id: accountId, type, amount, category, description, transaction_date: transactionDate ? `${transactionDate}T05:00:00.000Z` : new Date().toISOString(), image_url: key ? `/api/receipts/${encodeURIComponent(key)}` : null, image_key: key })
+        return json({ transaction }, 201)
+      } catch (error) {
+        if (key && env.RECEIPTS) await env.RECEIPTS.delete(key)
+        throw error
+      }
     } catch (error) {
-      if (env.RECEIPTS) await env.RECEIPTS.delete(key)
       return fail(error instanceof Error ? error.message : 'อ่านรูปภาพไม่สำเร็จ', 422)
     }
   }

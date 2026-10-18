@@ -16,10 +16,11 @@ type Page = 'overview' | 'transactions' | 'accounts' | 'settings' | 'admin'
 
 const money = (amount: number) => new Intl.NumberFormat('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(amount)
 const dateLabel = (value: string) => new Intl.DateTimeFormat('th-TH', { day: 'numeric', month: 'short' }).format(new Date(value))
+const inputDate = (value?: string) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit' }).format(value ? new Date(value) : new Date())
 const fullDate = new Intl.DateTimeFormat('th-TH', { dateStyle: 'long' }).format(new Date())
 const accountKinds: Record<string, string> = { bank: 'ธนาคาร', e_wallet: 'e-Wallet', cash: 'เงินสด', other: 'อื่น ๆ' }
 const categoryMarks: Record<string, string> = { อาหาร: 'F', เดินทาง: 'T', ช้อปปิ้ง: 'S', ที่อยู่อาศัย: 'H', สุขภาพ: 'W', รายรับ: '↗' }
-const APP_VERSION = 'v1.0.2'
+const APP_VERSION = 'v1.0.3'
 
 function App() {
   const [user, setUser] = useState<User | null>(null)
@@ -35,6 +36,7 @@ function App() {
   const [refresh, setRefresh] = useState(0)
   const [query, setQuery] = useState('')
   const [transactionType, setTransactionType] = useState<'all' | 'income' | 'expense'>('all')
+  const [overviewPeriod, setOverviewPeriod] = useState<'day' | 'week' | 'month'>('month')
 
   const notify = (message: string) => {
     setNotice(message)
@@ -49,9 +51,9 @@ function App() {
 
   useEffect(() => {
     if (!user) return
-    api<Dashboard>('/api/dashboard').then(setDashboard).catch((error) => notify(error.message))
+    api<Dashboard>(`/api/dashboard?period=${overviewPeriod}`).then(setDashboard).catch((error) => notify(error.message))
     api<Transaction[]>('/api/transactions').then(setAllTransactions).catch(() => undefined)
-  }, [user, refresh])
+  }, [user, refresh, overviewPeriod])
 
   async function authenticate(email: string, password: string, isRegister: boolean) {
     setLoading(true)
@@ -127,7 +129,7 @@ function App() {
           </div>
         </header>
 
-        {page === 'overview' && <Overview dashboard={dashboard} onAdd={startTransaction} onNavigate={setPage} />}
+        {page === 'overview' && <Overview dashboard={dashboard} period={overviewPeriod} onPeriodChange={setOverviewPeriod} onAdd={startTransaction} onNavigate={setPage} />}
         {page === 'transactions' && <TransactionsPage transactions={allTransactions} query={query} onQuery={setQuery} typeFilter={transactionType} onTypeFilter={setTransactionType} onAdd={startTransaction} onDelete={deleteTransaction} onEdit={(transaction) => { setEditingTransaction(transaction); setDialog('transaction') }} />}
         {page === 'accounts' && <AccountsPage accounts={dashboard.accounts} onAdd={() => startAccount()} onEdit={startAccount} onDelete={deleteAccount} />}
         {page === 'settings' && <NotificationSettings notify={notify} />}
@@ -217,15 +219,24 @@ function AuthScreen({ onSubmit, loading, notice }: { onSubmit: (email: string, p
   </main>
 }
 
-function Overview({ dashboard, onAdd, onNavigate }: { dashboard: Dashboard; onAdd: () => void; onNavigate: (page: Page) => void }) {
-  const chartData = dashboard.trend.map((item) => ({ name: String(Number(item.day)), value: Math.round(item.total) }))
+function Overview({ dashboard, period, onPeriodChange, onAdd, onNavigate }: { dashboard: Dashboard; period: 'day' | 'week' | 'month'; onPeriodChange: (period: 'day' | 'week' | 'month') => void; onAdd: () => void; onNavigate: (page: Page) => void }) {
+  const periodLabels = { day: 'วันนี้', week: 'สัปดาห์นี้', month: 'เดือนนี้' }
+  const chartData = dashboard.trend.map((item) => ({
+    name: period === 'day' ? 'วันนี้' : period === 'week'
+      ? new Intl.DateTimeFormat('th-TH', { weekday: 'short' }).format(new Date(`${item.day}T12:00:00+07:00`))
+      : String(Number(item.day.slice(-2))),
+    value: Math.round(item.total),
+  }))
+  const rangeStart = dashboard.trend[0]?.day
+  const rangeEnd = dashboard.trend.at(-1)?.day
+  const rangeLabel = (value?: string) => value ? new Intl.DateTimeFormat('th-TH', { day: 'numeric', month: 'short' }).format(new Date(`${value}T12:00:00+07:00`)) : '-'
   return <section className="page-body">
-    <div className="page-heading"><div><p className="eyebrow">{new Intl.DateTimeFormat('th-TH', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).format(new Date())} <span className="heading-dot" /></p><h1>ภาพรวมการเงิน</h1><p className="heading-sub">นี่คือภาพรวมการเงินของคุณในเดือนนี้</p></div><button className="primary-button" onClick={onAdd}><Plus size={17} /> เพิ่มรายการ</button></div>
+    <div className="page-heading"><div><p className="eyebrow">{new Intl.DateTimeFormat('th-TH', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).format(new Date())} <span className="heading-dot" /></p><h1>ภาพรวมการเงิน</h1><p className="heading-sub">สรุปข้อมูล{periodLabels[period]}</p></div><button className="primary-button" onClick={onAdd}><Plus size={17} /> เพิ่มรายการ</button></div>
     <div className="overview-grid">
-      <section className="balance-panel"><div className="balance-top"><div><span className="balance-label">ยอดเงินรวมทั้งหมด</span><span className="balance-period"><i /> ทุกบัญชีของคุณ</span></div><button className="dark-icon-button" aria-label="ดูบัญชีทั้งหมด" title="ดูบัญชีทั้งหมด" onClick={() => onNavigate('accounts')}><ArrowRight size={16} /></button></div><div className="balance-number"><span className="baht">฿</span>{money(dashboard.balance)}<span className="balance-decimal">THB</span></div><div className="balance-divider" /><div className="balance-stats"><div><span><ArrowDownLeft size={14} /> รายรับเดือนนี้</span><b>฿ {money(dashboard.income)}</b></div><div><span><ArrowUpRight size={14} /> รายจ่ายเดือนนี้</span><b>฿ {money(dashboard.expense)}</b></div><div className="balance-note">หลังหักรายจ่าย <b>฿ {money(dashboard.income - dashboard.expense)}</b></div></div><div className="balance-watermark">L</div></section>
-      <section className="insight-panel"><div className="section-top"><div><span className="section-kicker">สรุปการใช้จ่าย</span><h2>เดือนนี้เป็นอย่างไร</h2></div><span className="period-label">เดือนนี้</span></div><div className="insight-total"><strong>฿ {money(dashboard.expense)}</strong><span className="positive-change"><TrendingDown size={14} /> รายจ่ายรวม</span></div><div className="spend-chart"><ResponsiveContainer width="100%" height="100%"><AreaChart data={chartData} margin={{ top: 12, right: 4, left: -22, bottom: 0 }}><defs><linearGradient id="spendFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#7c987f" stopOpacity={0.28} /><stop offset="100%" stopColor="#7c987f" stopOpacity={0.01} /></linearGradient></defs><CartesianGrid vertical={false} stroke="#e9ebe5" strokeDasharray="3 5" /><XAxis dataKey="name" interval={Math.max(0, Math.floor(chartData.length / 5))} axisLine={false} tickLine={false} tick={{ fill: '#899087', fontSize: 10 }} tickMargin={9} /><YAxis axisLine={false} tickLine={false} tick={{ fill: '#a0a69c', fontSize: 10 }} tickFormatter={(value) => value >= 1000 ? `${value / 1000}k` : value} /><Tooltip labelFormatter={(label) => `วันที่ ${label}`} formatter={(value) => [`฿${money(Number(value))}`, 'รายจ่าย']} contentStyle={{ border: '1px solid #e7e9e2', borderRadius: 8, fontSize: 12 }} /><Area type="monotone" dataKey="value" stroke="#68836c" strokeWidth={2.5} fill="url(#spendFill)" /></AreaChart></ResponsiveContainer></div><div className="chart-range"><span>วันที่ 1</span><span>วันที่ {Number(dashboard.trend.at(-1)?.day || 1)}</span></div></section>
+      <section className="balance-panel"><div className="balance-top"><div><span className="balance-label">ยอดเงินรวมทั้งหมด</span><span className="balance-period"><i /> ทุกบัญชีของคุณ</span></div><button className="dark-icon-button" aria-label="ดูบัญชีทั้งหมด" title="ดูบัญชีทั้งหมด" onClick={() => onNavigate('accounts')}><ArrowRight size={16} /></button></div><div className="balance-number"><span className="baht">฿</span>{money(dashboard.balance)}<span className="balance-decimal">THB</span></div><div className="balance-divider" /><div className="balance-stats"><div><span><ArrowDownLeft size={14} /> รายรับ{periodLabels[period]}</span><b>฿ {money(dashboard.income)}</b></div><div><span><ArrowUpRight size={14} /> รายจ่าย{periodLabels[period]}</span><b>฿ {money(dashboard.expense)}</b></div><div className="balance-note">หลังหักรายจ่าย <b>฿ {money(dashboard.income - dashboard.expense)}</b></div></div><div className="balance-watermark">L</div></section>
+      <section className="insight-panel"><div className="section-top"><div><span className="section-kicker">สรุปการใช้จ่าย</span><h2>{periodLabels[period]}เป็นอย่างไร</h2></div><label className="period-select"><span className="sr-only">เลือกช่วงเวลาภาพรวม</span><select value={period} onChange={(event) => onPeriodChange(event.target.value as 'day' | 'week' | 'month')}><option value="day">วัน</option><option value="week">สัปดาห์</option><option value="month">เดือน</option></select><ChevronDown size={13} /></label></div><div className="insight-total"><strong>฿ {money(dashboard.expense)}</strong><span className="positive-change"><TrendingDown size={14} /> รายจ่ายรวม</span></div><div className="spend-chart"><ResponsiveContainer width="100%" height="100%"><AreaChart data={chartData} margin={{ top: 12, right: 4, left: -22, bottom: 0 }}><defs><linearGradient id="spendFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#7c987f" stopOpacity={0.28} /><stop offset="100%" stopColor="#7c987f" stopOpacity={0.01} /></linearGradient></defs><CartesianGrid vertical={false} stroke="#e9ebe5" strokeDasharray="3 5" /><XAxis dataKey="name" interval={Math.max(0, Math.floor(chartData.length / 5))} axisLine={false} tickLine={false} tick={{ fill: '#899087', fontSize: 10 }} tickMargin={9} /><YAxis axisLine={false} tickLine={false} tick={{ fill: '#a0a69c', fontSize: 10 }} tickFormatter={(value) => value >= 1000 ? `${value / 1000}k` : value} /><Tooltip formatter={(value) => [`฿${money(Number(value))}`, 'รายจ่าย']} contentStyle={{ border: '1px solid #e7e9e2', borderRadius: 8, fontSize: 12 }} /><Area type="monotone" dataKey="value" stroke="#68836c" strokeWidth={2.5} fill="url(#spendFill)" /></AreaChart></ResponsiveContainer></div><div className="chart-range"><span>{rangeLabel(rangeStart)}</span><span>{rangeLabel(rangeEnd)}</span></div></section>
       <section className="accounts-panel"><div className="section-top"><div><span className="section-kicker">FINANCIAL ACCOUNTS</span><h2>บัญชีของฉัน <span className="count-pill">{dashboard.accounts.length}</span></h2></div><button className="text-link" onClick={() => onNavigate('accounts')}>ดูทั้งหมด <ArrowRight size={14} /></button></div>{dashboard.accounts.length ? <div className="account-list">{dashboard.accounts.slice(0, 3).map((account, index) => <AccountRow key={account.id} account={account} index={index} />)}</div> : <EmptyState title="ยังไม่มีบัญชี" detail="เพิ่มบัญชีแรกเพื่อเริ่มจัดการเงิน" />}</section>
-      <section className="category-panel"><div className="section-top"><div><span className="section-kicker">SPENDING BREAKDOWN</span><h2>หมวดหมู่ยอดนิยม</h2></div><button className="more-quiet" aria-label="ดูรายการทั้งหมด" title="ดูรายการทั้งหมด" onClick={() => onNavigate('transactions')}><ArrowRight size={16} /></button></div>{dashboard.categories.length ? <div className="category-list">{dashboard.categories.map((item, index) => <div className="category-row" key={item.category}><span className="category-glyph" style={{ background: ['#f6ece2', '#edf1e8', '#f7f2df', '#eaf0ed', '#f3e9e4'][index % 5], color: ['#c47d48', '#6b876f', '#b89a46', '#628377', '#ad745e'][index % 5] }}>{categoryMarks[item.category] || item.category.slice(0, 1)}</span><span className="category-name">{item.category}</span><span className="category-amount">฿ {money(item.total)}</span></div>)}</div> : <EmptyState title="ยังไม่มีข้อมูลเดือนนี้" detail="รายการใช้จ่ายจะแสดงตรงนี้" />}</section>
+      <section className="category-panel"><div className="section-top"><div><span className="section-kicker">SPENDING BREAKDOWN</span><h2>หมวดหมู่ยอดนิยม</h2></div><button className="more-quiet" aria-label="ดูรายการทั้งหมด" title="ดูรายการทั้งหมด" onClick={() => onNavigate('transactions')}><ArrowRight size={16} /></button></div>{dashboard.categories.length ? <div className="category-list">{dashboard.categories.map((item, index) => <div className="category-row" key={item.category}><span className="category-glyph" style={{ background: ['#f6ece2', '#edf1e8', '#f7f2df', '#eaf0ed', '#f3e9e4'][index % 5], color: ['#c47d48', '#6b876f', '#b89a46', '#628377', '#ad745e'][index % 5] }}>{categoryMarks[item.category] || item.category.slice(0, 1)}</span><span className="category-name">{item.category}</span><span className="category-amount">฿ {money(item.total)}</span></div>)}</div> : <EmptyState title={`ยังไม่มีข้อมูล${periodLabels[period]}`} detail="รายการใช้จ่ายจะแสดงตรงนี้" />}</section>
     </div>
     <section className="transactions-panel"><div className="section-top transaction-section-top"><div><span className="section-kicker">RECENT ACTIVITY</span><h2>รายการล่าสุด</h2></div><button className="text-link" onClick={() => onNavigate('transactions')}>ดูรายการทั้งหมด <ArrowRight size={14} /></button></div><TransactionTable transactions={dashboard.transactions} compact /></section>
   </section>
@@ -377,7 +388,7 @@ function AdminPage({ currentUserId, adminEmail, notify }: { currentUserId: strin
   </section>
 }
 
-function TransactionDialog({ accounts, existing, onClose, onSave, onUploaded, notify }: { accounts: Account[]; existing?: Transaction; onClose: () => void; onSave: (input: { account_id: string; type: string; amount: number; category: string; description: string }, transactionId?: string) => Promise<void>; onUploaded: () => void; notify: (message: string) => void }) {
+function TransactionDialog({ accounts, existing, onClose, onSave, onUploaded, notify }: { accounts: Account[]; existing?: Transaction; onClose: () => void; onSave: (input: { account_id: string; type: string; amount: number; category: string; description: string; transaction_date?: string }, transactionId?: string) => Promise<void>; onUploaded: () => void; notify: (message: string) => void }) {
   const [mode, setMode] = useState<'manual' | 'ai'>(existing ? 'manual' : 'ai')
   const [text, setText] = useState('')
   const [parsing, setParsing] = useState(false)
@@ -387,24 +398,56 @@ function TransactionDialog({ accounts, existing, onClose, onSave, onUploaded, no
   const [amount, setAmount] = useState(existing ? String(existing.amount) : '')
   const [category, setCategory] = useState(existing?.category || 'อาหาร')
   const [description, setDescription] = useState(existing?.description || '')
+  const [transactionDate, setTransactionDate] = useState(inputDate(existing?.transaction_date))
   const [file, setFile] = useState<File | null>(null)
+  const [slipReview, setSlipReview] = useState(false)
   async function parseText() {
     setParsing(true)
     try {
-      const result = await api<{ parsed: { amount: number; type: 'income' | 'expense'; category: string; description: string }; account_id: string }>('/api/ai/parse', { method: 'POST', body: jsonBody({ text }) })
-      setAmount(String(result.parsed.amount)); setType(result.parsed.type); setCategory(result.parsed.category); setDescription(result.parsed.description); setAccountId(result.account_id); setMode('manual')
+      const result = await api<{ parsed: { amount: number; type: 'income' | 'expense'; category: string; description: string; transaction_date?: string }; account_id: string }>('/api/ai/parse', { method: 'POST', body: jsonBody({ text }) })
+      setAmount(String(result.parsed.amount)); setType(result.parsed.type); setCategory(result.parsed.category); setDescription(result.parsed.description); setAccountId(result.account_id)
+      if (result.parsed.transaction_date) setTransactionDate(inputDate(result.parsed.transaction_date))
+      setSlipReview(false); setMode('manual')
     } catch (error) { notify(error instanceof Error ? error.message : 'AI ประมวลผลไม่สำเร็จ') }
     finally { setParsing(false) }
   }
-  async function upload() {
+  async function previewSlip() {
     if (!file) return
     setSaving(true)
-    try { const form = new FormData(); form.append('file', file); await api('/api/ai/slip', { method: 'POST', body: form }); onUploaded() }
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const result = await api<{ parsed: { amount: number; type: 'income' | 'expense'; category: string; description: string; transaction_date?: string }; account_id: string }>('/api/ai/slip/preview', { method: 'POST', body: form })
+      setAmount(String(result.parsed.amount)); setType(result.parsed.type); setCategory(result.parsed.category); setDescription(result.parsed.description); setAccountId(result.account_id)
+      if (result.parsed.transaction_date) setTransactionDate(inputDate(result.parsed.transaction_date))
+      setSlipReview(true); setMode('manual')
+      notify('อ่านข้อมูลแล้ว กรุณาตรวจสอบก่อนยืนยันบันทึก')
+    }
     catch (error) { notify(error instanceof Error ? error.message : 'อ่านสลิปไม่สำเร็จ') }
     finally { setSaving(false) }
   }
-  async function submit(event: FormEvent) { event.preventDefault(); setSaving(true); try { await onSave({ account_id: accountId, type, amount: Number(amount), category, description }, existing?.id) } catch (error) { notify(error instanceof Error ? error.message : 'บันทึกไม่สำเร็จ') } finally { setSaving(false) } }
-  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal transaction-modal" role="dialog" aria-modal="true" aria-labelledby="transaction-title"><div className="modal-head"><div><span className="section-kicker">{existing ? 'EDIT TRANSACTION' : 'NEW TRANSACTION'}</span><h2 id="transaction-title">{existing ? 'แก้ไขรายการ' : 'เพิ่มรายการ'}</h2></div><button className="icon-button" aria-label="ปิด" onClick={onClose}><X size={19} /></button></div><div className="mode-tabs"><button className={mode === 'ai' ? 'selected' : ''} onClick={() => setMode('ai')}><Sparkles size={15} /> AI ช่วยบันทึก</button><button className={mode === 'manual' ? 'selected' : ''} onClick={() => setMode('manual')}><FileText size={15} /> กรอกเอง</button></div>{mode === 'ai' && <div className="ai-entry"><label>เล่าให้เราฟังว่าเกิดอะไรขึ้น<textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="เช่น กินข้าวขาหมู 80 บาท ตัดจาก TrueMoney" rows={3} /></label><button className="ai-parse-button" onClick={parseText} disabled={!text.trim() || parsing}>{parsing ? <LoaderCircle size={16} className="spin" /> : <Sparkles size={16} />} วิเคราะห์ด้วย AI</button><div className="upload-divider"><span>หรือแนบสลิป / ใบเสร็จ</span></div><label className="upload-box"><input type="file" accept="image/*" onChange={(event) => setFile(event.target.files?.[0] || null)} /><span className="upload-icon"><FileImage size={19} /></span><b>{file ? file.name : 'เลือกรูปภาพสลิปหรือใบเสร็จ'}</b><small>{file ? `${(file.size / 1024 / 1024).toFixed(1)} MB` : 'PNG, JPG สูงสุด 8 MB'}</small></label>{file && <button className="primary-button upload-submit" onClick={upload} disabled={saving}>{saving ? <LoaderCircle size={16} className="spin" /> : <Sparkles size={16} />} อ่านและบันทึกสลิป</button>}</div>}{mode === 'manual' && <form className="manual-form" onSubmit={submit}><label>ประเภท<div className="segmented"><button type="button" className={type === 'expense' ? 'selected expense' : ''} onClick={() => setType('expense')}><ArrowUpRight size={15} /> รายจ่าย</button><button type="button" className={type === 'income' ? 'selected income' : ''} onClick={() => setType('income')}><ArrowDownLeft size={15} /> รายรับ</button></div></label><label>จำนวนเงิน (บาท)<input type="number" min="0.01" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} placeholder="0.00" required /></label><div className="two-field-row"><label>หมวดหมู่<input value={category} onChange={(event) => setCategory(event.target.value)} required /></label><label>บัญชี<select value={accountId} onChange={(event) => setAccountId(event.target.value)} required>{accounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}</select></label></div><label>รายละเอียด<input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="เช่น มื้อกลางวัน" /></label><button className="primary-button modal-submit" disabled={saving || !accounts.length}>{saving ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />} บันทึกรายการ</button></form>}</section></div>
+  async function submit(event: FormEvent) {
+    event.preventDefault()
+    setSaving(true)
+    try {
+      if (slipReview && file) {
+        const form = new FormData()
+        form.append('file', file)
+        form.append('account_id', accountId)
+        form.append('type', type)
+        form.append('amount', amount)
+        form.append('category', category)
+        form.append('description', description)
+        form.append('transaction_date', transactionDate)
+        await api('/api/ai/slip', { method: 'POST', body: form })
+        onUploaded()
+      } else {
+        await onSave({ account_id: accountId, type, amount: Number(amount), category, description, transaction_date: new Date(`${transactionDate}T12:00:00+07:00`).toISOString() }, existing?.id)
+      }
+    } catch (error) { notify(error instanceof Error ? error.message : 'บันทึกไม่สำเร็จ') }
+    finally { setSaving(false) }
+  }
+  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal transaction-modal" role="dialog" aria-modal="true" aria-labelledby="transaction-title"><div className="modal-head"><div><span className="section-kicker">{existing ? 'EDIT TRANSACTION' : 'NEW TRANSACTION'}</span><h2 id="transaction-title">{existing ? 'แก้ไขรายการ' : 'เพิ่มรายการ'}</h2></div><button className="icon-button" aria-label="ปิด" onClick={onClose}><X size={19} /></button></div><div className="mode-tabs"><button type="button" className={mode === 'ai' ? 'selected' : ''} onClick={() => setMode('ai')}><Sparkles size={15} /> AI ช่วยบันทึก</button><button type="button" className={mode === 'manual' ? 'selected' : ''} onClick={() => setMode('manual')}><FileText size={15} /> กรอกเอง</button></div>{mode === 'ai' && <div className="ai-entry"><label>เล่าให้เราฟังว่าเกิดอะไรขึ้น<textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="เช่น กินข้าวขาหมู 80 บาท ตัดจาก TrueMoney" rows={3} /></label><button className="ai-parse-button" onClick={parseText} disabled={!text.trim() || parsing}>{parsing ? <LoaderCircle size={16} className="spin" /> : <Sparkles size={16} />} วิเคราะห์ด้วย AI</button><div className="upload-divider"><span>หรือแนบสลิป / ใบเสร็จ</span></div><label className="upload-box"><input type="file" accept="image/*" onChange={(event) => { setFile(event.target.files?.[0] || null); setSlipReview(false) }} /><span className="upload-icon"><FileImage size={19} /></span><b>{file ? file.name : 'เลือกรูปภาพสลิปหรือใบเสร็จ'}</b><small>{file ? `${(file.size / 1024 / 1024).toFixed(1)} MB` : 'PNG, JPG สูงสุด 8 MB'}</small></label>{file && <button className="primary-button upload-submit" onClick={previewSlip} disabled={saving}>{saving ? <LoaderCircle size={16} className="spin" /> : <Sparkles size={16} />} อ่านภาพเพื่อแสดงตัวอย่าง</button>}</div>}{mode === 'manual' && <form className="manual-form" onSubmit={submit}>{slipReview && <p className="slip-review-notice"><Sparkles size={15} /> ตรวจสอบยอดเงิน ประเภท และบัญชีให้ถูกต้อง รูปภาพจะถูกบันทึกพร้อมรายการเมื่อกดยืนยัน</p>}<label>ประเภท<div className="segmented"><button type="button" className={type === 'expense' ? 'selected expense' : ''} onClick={() => setType('expense')}><ArrowUpRight size={15} /> รายจ่าย</button><button type="button" className={type === 'income' ? 'selected income' : ''} onClick={() => setType('income')}><ArrowDownLeft size={15} /> รายรับ</button></div></label><label>จำนวนเงิน (บาท)<input type="number" min="0.01" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} placeholder="0.00" required /></label><div className="two-field-row"><label>หมวดหมู่<input value={category} onChange={(event) => setCategory(event.target.value)} required /></label><label>บัญชี<select value={accountId} onChange={(event) => setAccountId(event.target.value)} required>{accounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}</select></label></div><label>วันที่<input type="date" value={transactionDate} onChange={(event) => setTransactionDate(event.target.value)} required /></label><label>รายละเอียด<input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="เช่น มื้อกลางวัน" /></label><button className="primary-button modal-submit" disabled={saving || !accounts.length}>{saving ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}{slipReview ? 'ยืนยันและบันทึกรายการ' : 'บันทึกรายการ'}</button></form>}</section></div>
 }
 
 function AccountDialog({ existing, onClose, onSaved, notify }: { existing?: Account; onClose: () => void; onSaved: () => void; notify: (message: string) => void }) {
