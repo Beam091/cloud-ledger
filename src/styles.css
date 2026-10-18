@@ -94,3 +94,59 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 
 /* Transfer transaction marks */
 .transaction-mark.mark-transfer { background: #eef2f7; color: #5a7fa8; }
+
+/* Budget, recurring, and export UI */
+.budget-panel { padding: 17px 19px 13px; }
+.budget-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 22px; }
+.budget-row { min-width: 0; padding: 13px 0 11px; border-top: 1px solid #f0f1ed; }
+.budget-head { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: baseline; gap: 9px; }
+.budget-head b { overflow: hidden; color: #485047; font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.budget-numbers { color: #7c8479; font-size: 9px; white-space: nowrap; }
+.budget-percent { min-width: 35px; color: #697568; font-size: 9px; font-weight: 600; text-align: right; }
+.budget-track { height: 5px; overflow: hidden; margin-top: 7px; border-radius: 4px; background: #edf0e9; }
+.budget-fill { display: block; height: 100%; border-radius: inherit; background: #7c987f; transition: width .2s ease; }
+.budget-fill[data-status="warn"] { background: #c29d4d; }
+.budget-fill[data-status="over"] { background: #c47a5f; }
+.budget-foot { display: flex; min-height: 25px; align-items: center; justify-content: space-between; gap: 8px; }
+.budget-foot small { color: #969d92; font-size: 8px; }
+.budget-foot .row-actions { gap: 1px; }
+.budget-foot .row-action { width: 24px; height: 24px; }
+.budget-empty { display: grid; grid-template-columns: 31px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 13px 0 8px; border-top: 1px solid #f0f1ed; color: #7b8c77; }
+.budget-empty > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.budget-empty b { color: #4a5549; font-size: 10px; font-weight: 600; }
+.budget-empty small { color: #969d92; font-size: 9px; line-height: 1.55; }
+.budget-suggestions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0 41px; padding: 0; list-style: none; }
+.budget-suggestions button { min-height: 25px; padding: 0 8px; border: 1px solid #e7ebe3; border-radius: 5px; background: #fafbf9; color: #6f7d6b; cursor: pointer; font-size: 9px; }
+.budget-suggestions button:hover { border-color: #cbd8c7; background: #f2f6ef; }
+.recurring-table { min-width: 760px; }
+.recurring-table th:first-child { width: 28%; }
+.recurring-table th:nth-child(2) { width: 13%; }
+.recurring-table th:nth-child(3) { width: 23%; }
+.recurring-table th:nth-child(4) { width: 14%; }
+.recurring-table th.amount-head { width: 15%; }
+.recurring-table th:last-child { width: 7%; }
+.recurring-table thead th { height: 36px; font-size: 9px; }
+.recurring-table tbody tr { height: 58px; }
+.recurring-table td { padding: 0 5px; font-size: 10px; }
+.recurring-table .transaction-title b { font-size: 10px; }
+.recurring-table .transaction-title small { font-size: 9px; }
+.recurring-table .category-tag { font-size: 9px; }
+.recurring-paused { opacity: .62; }
+.data-card { display: grid; grid-template-columns: 38px minmax(0, 1fr) auto; align-items: center; gap: 12px; margin-top: 17px; padding: 14px 15px; border: 1px solid #e8eae4; border-radius: 8px; background: #fff; }
+.data-card-icon { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 8px; background: #edf2ec; color: #658167; }
+.data-copy { min-width: 0; }
+.data-copy b { color: #454e44; font-size: 10px; font-weight: 600; }
+.data-copy p { margin: 3px 0 0; color: #92998f; font-size: 9px; line-height: 1.55; }
+.data-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.data-actions .outline-button, .data-actions .primary-button { min-height: 32px; margin: 0; padding: 0 9px; font-size: 9px; }
+
+@media (max-width: 620px) {
+  .budget-list { grid-template-columns: 1fr; }
+  .budget-empty { grid-template-columns: 28px minmax(0, 1fr); }
+  .budget-empty > .outline-small { grid-column: 2; justify-self: start; }
+  .budget-suggestions { margin-left: 38px; }
+  .recurring-table { min-width: 760px; }
+  .data-card { grid-template-columns: 30px minmax(0, 1fr); gap: 9px; padding: 12px; }
+  .data-card-icon { width: 29px; height: 29px; }
+  .data-actions { grid-column: 1 / -1; justify-content: flex-start; padding-top: 2px; }
+}

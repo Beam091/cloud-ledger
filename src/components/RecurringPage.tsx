@@ -11,7 +11,7 @@ export function RecurringPage({ items, accounts, onAdd, onEdit, onToggle, onDele
     <div className="page-heading"><div><p className="eyebrow">SET IT AND FORGET IT</p><h1>รายการประจำ</h1><p className="heading-sub">ค่าเช่า ค่าเน็ต หรือเงินเดือน ระบบจะบันทึกให้เองตามรอบที่ตั้งไว้</p></div><button className="primary-button" onClick={onAdd} disabled={!hasAccounts}><Plus size={17} /> เพิ่มรายการประจำ</button></div>
     {!hasAccounts && <div className="accounts-empty"><EmptyState title="ต้องมีบัญชีก่อน" detail="เพิ่มบัญชีธนาคารหรือ e-Wallet ก่อนตั้งรายการประจำ" /></div>}
     <section className="transactions-panel">
-      {items.length ? <div className="table-scroll"><table className="transaction-table">
+      {items.length ? <div className="table-scroll"><table className="transaction-table recurring-table">
         <thead><tr><th>รายการ</th><th>รอบ</th><th>บัญชี</th><th>วันถัดไป</th><th className="amount-head">จำนวนเงิน</th><th /></tr></thead>
         <tbody>
           {items.map((item) => <tr key={item.id} className={item.is_active ? '' : 'recurring-paused'}>

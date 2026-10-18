@@ -72,7 +72,9 @@ function App() {
   useEffect(() => {
     if (!user) return
     api<Dashboard>(`/api/dashboard?period=${overviewPeriod}`).then(setDashboard).catch((error) => notify(error.message))
-    api<Transaction[]>('/api/transactions').then(setAllTransactions).catch(() => undefined)
+    api<Transaction[] | { results: Transaction[] }>('/api/transactions')
+      .then((result) => setAllTransactions(Array.isArray(result) ? result : result.results))
+      .catch((error) => notify(error instanceof Error ? error.message : 'โหลดรายการไม่สำเร็จ'))
     api<{ results: Recurring[] }>('/api/recurring').then(({ results }) => setRecurringItems(results)).catch(() => undefined)
   }, [user, refresh, overviewPeriod])
 
