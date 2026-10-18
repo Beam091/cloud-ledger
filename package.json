@@ -1,13 +1,15 @@
 {
   "name": "cloud-ledger",
   "private": true,
-  "version": "1.0.6",
+  "version": "1.0.7",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "dev:api": "wrangler dev --config worker/wrangler.toml --ip 0.0.0.0 --port 8787",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
+    "test": "vitest run",
+    "check:worker": "tsc --noEmit --strict --target ES2022 --lib ES2022 --module ESNext --moduleResolution bundler --types @cloudflare/workers-types worker/src/index.ts",
     "deploy": "npm run build && wrangler deploy --config worker/wrangler.toml",
     "deploy:pages": "npm run build && wrangler pages deploy dist",
     "deploy:api": "wrangler deploy --config worker/wrangler.toml",
@@ -29,6 +31,7 @@
     "tailwindcss": "^4.0.0",
     "typescript": "~5.7.2",
     "vite": "^6.0.5",
+    "vitest": "^3.2.7",
     "wrangler": "^3.100.0"
   }
 }

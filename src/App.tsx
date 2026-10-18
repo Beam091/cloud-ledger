@@ -20,7 +20,7 @@ const inputDate = (value?: string) => new Intl.DateTimeFormat('en-CA', { timeZon
 const fullDate = new Intl.DateTimeFormat('th-TH', { dateStyle: 'long' }).format(new Date())
 const accountKinds: Record<string, string> = { bank: 'ธนาคาร', e_wallet: 'e-Wallet', cash: 'เงินสด', other: 'อื่น ๆ' }
 const categoryMarks: Record<string, string> = { อาหาร: 'F', เดินทาง: 'T', ช้อปปิ้ง: 'S', ที่อยู่อาศัย: 'H', สุขภาพ: 'W', รายรับ: '↗' }
-const APP_VERSION = 'v1.0.6'
+const APP_VERSION = 'v1.0.7'
 
 function App() {
   const [user, setUser] = useState<User | null>(null)

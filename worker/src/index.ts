@@ -1,4 +1,11 @@
 import { connect } from 'cloudflare:sockets'
+import { base64url, decoder, encoder, fromBase64 } from './lib/encoding'
+import { signedAmount, toBaht, toSatang } from './lib/money'
+import { dateInTz, tzOffsetMinutes } from './lib/timezone'
+import { cronMatches } from './lib/cron'
+import { tokenFor } from './lib/credentials'
+import { decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, verifyResetCode } from './lib/credentials'
+import { accountAliasVariants, normalizeAccountName, scoreAccountMatch } from './lib/accountMatch'
 
 interface Env {
   DB: D1Database
@@ -19,28 +26,6 @@ interface NotificationRow { user_id: string; gmail_enabled: number; gmail_addres
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8' } })
 const fail = (message: string, status = 400) => json({ error: message }, status)
 const id = () => crypto.randomUUID()
-const encoder = new TextEncoder()
-const decoder = new TextDecoder()
-
-function base64url(bytes: Uint8Array) {
-  let binary = ''
-  bytes.forEach((byte) => { binary += String.fromCharCode(byte) })
-  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
-}
-
-function fromBase64(value: string) {
-  const binary = atob(value.replaceAll('-', '+').replaceAll('_', '/'))
-  return Uint8Array.from(binary, (char) => char.charCodeAt(0))
-}
-
-async function tokenFor(user: AuthUser, secret: string, tokenVersion = 0) {
-  const header = base64url(encoder.encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })))
-  const payload = base64url(encoder.encode(JSON.stringify({ ...user, ver: tokenVersion, exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 14 })))
-  const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
-  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(`${header}.${payload}`))
-  return `${header}.${payload}.${base64url(new Uint8Array(signature))}`
-}
-
 async function authenticate(request: Request, env: Env): Promise<AuthUser | null> {
   const token = request.headers.get('authorization')?.replace(/^Bearer\s+/i, '')
   if (!token) return null
@@ -60,50 +45,8 @@ async function body<T>(request: Request): Promise<T> {
   catch { return {} as T }
 }
 
-async function passwordHash(password: string, salt = crypto.getRandomValues(new Uint8Array(16))) {
-  const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits'])
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 100_000, hash: 'SHA-256' }, key, 256)
-  return `${base64url(salt)}.${base64url(new Uint8Array(bits))}`
-}
-
-async function passwordMatches(password: string, encoded: string) {
-  const [salt, expected] = encoded.split('.')
-  return (await passwordHash(password, fromBase64(salt))).split('.')[1] === expected
-}
-
-async function encrypt(value: string, secret: string) {
-  const raw = fromBase64(secret)
-  if (raw.byteLength !== 32) throw new Error('ENCRYPTION_KEY must be a base64-encoded 32-byte key')
-  const iv = crypto.getRandomValues(new Uint8Array(12))
-  const key = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt'])
-  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoder.encode(value))
-  return `${base64url(iv)}.${base64url(new Uint8Array(ciphertext))}`
-}
-
-async function decrypt(value: string, secret: string) {
-  const [iv, ciphertext] = value.split('.')
-  const key = await crypto.subtle.importKey('raw', fromBase64(secret), 'AES-GCM', false, ['decrypt'])
-  return decoder.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromBase64(iv) }, key, fromBase64(ciphertext)))
-}
-
-// Values may be stored encrypted (new) or as plain text (legacy rows); try decrypting first and fall back to the raw value
-async function maybeDecrypt(value: string | null, secret: string) {
-  if (!value) return null
-  if (!value.includes('.')) return value
-  try { return await decrypt(value, secret) }
-  catch { return value }
-}
-
-async function resetCodeDigest(userId: string, code: string, secret: string) {
-  const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
-  const digest = await crypto.subtle.sign('HMAC', key, encoder.encode(`${userId}:${code}`))
-  return base64url(new Uint8Array(digest))
-}
-
-async function verifyResetCode(userId: string, code: string, digest: string, secret: string) {
-  const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
-  return crypto.subtle.verify('HMAC', key, fromBase64(digest), encoder.encode(`${userId}:${code}`))
-}
+function toClientAccount<T extends { balance: number }>(row: T) { return { ...row, balance: toBaht(row.balance) } }
+function toClientTransaction<T extends { amount: number }>(row: T) { return { ...row, amount: toBaht(row.amount) } }
 
 async function settings(env: Env) {
   const result = await env.DB.prepare('SELECT key, value FROM system_settings').all<{ key: string; value: string }>()
@@ -116,62 +59,6 @@ function normalizedAiBaseUrl(value: string) {
   if (url.protocol !== 'https:' && !localHttp) throw new Error('AI base URL must use HTTPS')
   if (url.username || url.password || url.search || url.hash) throw new Error('AI base URL must not contain credentials, query, or fragment')
   return url.toString().replace(/\/+$/, '')
-}
-
-function normalizeAccountName(value: string) {
-  return String(value || '')
-    .trim()
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[\s\-_./()]+/g, '')
-    .replace(/[^a-z0-9ก-ฮ]/g, '')
-}
-
-const bankNameAliases: Record<string, string[]> = {
-  'กรุงไทย': ['ktb', 'krungthai', 'kbank', 'krungthai bank'],
-  'กสิกรไทย': ['kasikorn', 'kbankthai', 'kasikornbank'],
-  'ไทยพาณิชย์': ['scb', 'siamcommercialbank', 'thairath'],
-  'ทหารไทย': ['tmb', 'ttb', 'thanachart', 'tmbbank'],
-  'กรุงเทพ': ['bangkokbank', 'bbl'],
-  'ออมสิน': ['gsb', 'governmentsavingbank'],
-  'true money': ['truemoney', 'truemoneywallet', 'truewallet'],
-  'e-wallet': ['ewallet', 'wallet', 'วอลเล็ต', 'วอเลต', 'วอลเล็ท', 'กระเป๋าเงินออนไลน์'],
-  'promptpay': ['promptpay', 'พร้อมเพย์'],
-  'cash': ['เงินสด', 'cash'],
-}
-
-function accountAliasVariants(value: string) {
-  const variants = new Set<string>([normalizeAccountName(value)])
-  const normalized = normalizeAccountName(value)
-  for (const [canonical, aliases] of Object.entries(bankNameAliases)) {
-    const normalizedCanonical = normalizeAccountName(canonical)
-    if (!normalizedCanonical) continue
-    if (normalized === normalizedCanonical || aliases.some((alias) => normalizeAccountName(alias) === normalized)) {
-      variants.add(normalizedCanonical)
-      for (const alias of [canonical, ...aliases]) variants.add(normalizeAccountName(alias))
-    }
-  }
-  return [...variants].filter(Boolean)
-}
-
-function scoreAccountMatch(inputName: string, accountName: string) {
-  const input = normalizeAccountName(inputName)
-  const account = normalizeAccountName(accountName)
-  if (!input || !account) return 0
-  if (input === account) return 100
-
-  const inputVariants = accountAliasVariants(inputName)
-  const accountVariants = accountAliasVariants(accountName)
-  if (inputVariants.some((variant) => accountVariants.includes(variant))) return 90
-
-  if (account.includes(input) || input.includes(account)) return 75
-
-  const shortInput = input.slice(0, 3)
-  const shortAccount = account.slice(0, 3)
-  if (shortInput && shortAccount && (account.includes(shortInput) || input.includes(shortAccount))) return 40
-
-  return 0
 }
 
 async function findBestAccountForText(env: Env, userId: string, accountName?: string, inputText = '') {
@@ -221,31 +108,6 @@ async function parseWithAI(env: Env, input: string, image?: { mimeType: string; 
   const text = typeof messageContent === 'string' ? messageContent : messageContent?.map((part) => part.text || '').join('')
   if (!text) throw new Error('AI returned an empty response')
   return JSON.parse(text) as { amount: number; type: 'income' | 'expense'; category: string; account_name?: string; description: string; transaction_date?: string }
-}
-
-function signedAmount(type: string, amount: number) { return type === 'income' ? amount : -amount }
-
-// Money is stored in D1 as INTEGER satang (1/100 THB); the API keeps baht decimals.
-const SATANG_PER_BAHT = 100
-function toSatang(baht: number) { return Math.round(Number(baht) * SATANG_PER_BAHT) }
-function toBaht(satang: number) { return Number(satang) / SATANG_PER_BAHT }
-function toClientAccount<T extends { balance: number }>(row: T) { return { ...row, balance: toBaht(row.balance) } }
-function toClientTransaction<T extends { amount: number }>(row: T) { return { ...row, amount: toBaht(row.amount) } }
-
-function dateInTz(timezone: string, date = new Date()) {
-  try {
-    return new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date)
-  } catch { return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date) }
-}
-
-function tzOffsetMinutes(timezone: string) {
-  try {
-    const name = new Intl.DateTimeFormat('en-US', { timeZone: timezone, timeZoneName: 'longOffset' }).formatToParts(new Date()).find((part) => part.type === 'timeZoneName')?.value || ''
-    const match = name.match(/GMT([+-])(\d{2}):(\d{2})/)
-    if (!match) return 420
-    const sign = match[1] === '-' ? -1 : 1
-    return sign * (Number(match[2]) * 60 + Number(match[3]))
-  } catch { return 420 }
 }
 
 async function createTransaction(env: Env, user: AuthUser, data: Omit<TransactionRow, 'id' | 'user_id' | 'image_url' | 'image_key'> & { image_url?: string | null; image_key?: string | null }) {
@@ -693,43 +555,6 @@ async function emailSummary(env: Env, row: NotificationRow, summary: string, con
   if (!config.smtp_from_email || !config.smtp_app_password_encrypted) throw new Error('เว็บไซต์ยังไม่ได้ตั้งค่า Gmail sender')
   const subject = summary.includes('ประจำเดือน') ? 'สรุปการเงินประจำเดือน' : summary.includes('ประจำสัปดาห์') ? 'สรุปการเงินประจำสัปดาห์' : 'สรุปการเงินประจำวัน'
   await sendSmtpMail(env, config.smtp_from_email, config.smtp_app_password_encrypted, recipient, subject, summary)
-}
-
-function cronFieldMatches(field: string, value: number, min: number, max: number) {
-  return field.split(',').some((part) => {
-    const [range, stepText] = part.split('/')
-    const step = stepText ? Number(stepText) : 1
-    if (!Number.isInteger(step) || step < 1) return false
-    let start = min
-    let end = max
-    if (range !== '*') {
-      if (range.includes('-')) {
-        const [rangeStart, rangeEnd] = range.split('-').map(Number)
-        start = rangeStart
-        end = rangeEnd
-      } else {
-        start = Number(range)
-        end = stepText ? max : start
-      }
-    }
-    return Number.isInteger(start) && Number.isInteger(end) && start >= min && end <= max && start <= end && value >= start && value <= end && (value - start) % step === 0
-  })
-}
-
-function cronMatches(expression: string, date: Date, timezone: string) {
-  const fields = expression.trim().split(/\s+/)
-  if (fields.length !== 5) return false
-  const parts = new Intl.DateTimeFormat('en-US', { timeZone: timezone || 'Asia/Bangkok', minute: 'numeric', hour: 'numeric', hourCycle: 'h23', day: 'numeric', month: 'numeric', weekday: 'short' }).formatToParts(date)
-  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]))
-  const minute = Number(values.minute)
-  const hour = Number(values.hour)
-  const day = Number(values.day)
-  const month = Number(values.month)
-  const weekday = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(values.weekday)
-  const dayMatches = cronFieldMatches(fields[2], day, 1, 31)
-  const weekdayMatches = cronFieldMatches(fields[4], weekday, 0, 6)
-  const dateMatches = fields[2] === '*' || fields[4] === '*' ? dayMatches && weekdayMatches : dayMatches || weekdayMatches
-  return cronFieldMatches(fields[0], minute, 0, 59) && cronFieldMatches(fields[1], hour, 0, 23) && dateMatches && cronFieldMatches(fields[3], month, 1, 12)
 }
 
 async function dispatchNotification(env: Env, row: NotificationRow) {
