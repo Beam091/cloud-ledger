@@ -1,5 +1,8 @@
 const API_URL = import.meta.env.VITE_API_URL ?? ''
 
+// Base URL of the API (empty = same origin); downloads link directly to it
+export const API_BASE_URL = API_URL
+
 // Session lives in an httpOnly cookie set by the worker; the Bearer header is
 // only sent when a localStorage token from a pre-cookie session still exists.
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {

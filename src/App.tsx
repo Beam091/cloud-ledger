@@ -1,48 +1,44 @@
 import { useEffect, useState } from 'react'
 import {
   ArrowRight, Bell, Check, ChevronDown, CircleHelp, Clock3, FileText, LayoutDashboard,
-  LoaderCircle, LogOut, ShieldCheck, Wallet,
+  LoaderCircle, LogOut, Repeat, ShieldCheck, Wallet,
 } from 'lucide-react'
 import { api, clearLegacyToken, jsonBody } from './api'
 import { APP_VERSION, fullDate } from './lib/format'
-import type { Account, Dashboard, Page, PeriodFilter, Transaction, User } from './types'
+import { parseHash } from './lib/routing'
+import type { Account, Budget, Dashboard, Page, PeriodFilter, Recurring, Transaction, User } from './types'
 import { AuthScreen } from './components/AuthScreen'
 import { Overview } from './components/Overview'
 import { TransactionsPage } from './components/TransactionsPage'
 import { AccountsPage } from './components/AccountsPage'
+import { RecurringPage } from './components/RecurringPage'
 import { NotificationSettings } from './components/NotificationSettings'
 import { AdminPage } from './components/AdminPage'
 import { TransactionDialog } from './components/TransactionDialog'
 import { AccountDialog } from './components/AccountDialog'
+import { RecurringDialog } from './components/RecurringDialog'
+import { BudgetDialog } from './components/BudgetPanel'
 import { HelpDialog } from './components/HelpDialog'
 import { ConfirmDialog, type ConfirmRequest } from './components/ConfirmDialog'
-
-const knownPages: Page[] = ['overview', 'transactions', 'accounts', 'settings', 'admin']
-
-// The active page (and overview range) lives in the URL hash so a browser
-// refresh, or a shared link, restores the exact view: #/overview/week etc.
-function readHashState() {
-  const [page = '', param = ''] = window.location.hash.replace(/^#\/?/, '').split('/')
-  const knownPage = knownPages.includes(page as Page) ? (page as Page) : 'overview'
-  const period = param === 'day' || param === 'week' || param === 'month' ? param : null
-  return { page: knownPage, period: knownPage === 'overview' ? period as PeriodFilter | null : null }
-}
 
 function App() {
   const [user, setUser] = useState<User | null>(null)
   const [booting, setBooting] = useState(true)
-  const [page, setPage] = useState<Page>(() => readHashState().page)
-  const [dashboard, setDashboard] = useState<Dashboard>({ accounts: [], transactions: [], balance: 0, income: 0, expense: 0, categories: [], trend: [] })
+  const [page, setPage] = useState<Page>(() => parseHash(window.location.hash).page)
+  const [dashboard, setDashboard] = useState<Dashboard>({ accounts: [], transactions: [], balance: 0, income: 0, expense: 0, categories: [], trend: [], budgets: [] })
   const [allTransactions, setAllTransactions] = useState<Transaction[]>([])
+  const [recurringItems, setRecurringItems] = useState<Recurring[]>([])
   const [notice, setNotice] = useState('')
   const [loading, setLoading] = useState(false)
-  const [dialog, setDialog] = useState<'transaction' | 'account' | 'help' | null>(null)
+  const [dialog, setDialog] = useState<'transaction' | 'account' | 'recurring' | 'budget' | 'help' | null>(null)
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null)
   const [editingAccount, setEditingAccount] = useState<Account | null>(null)
+  const [editingRecurring, setEditingRecurring] = useState<Recurring | null>(null)
+  const [editingBudget, setEditingBudget] = useState<{ category?: string; amount?: number } | null>(null)
   const [refresh, setRefresh] = useState(0)
   const [query, setQuery] = useState('')
   const [transactionType, setTransactionType] = useState<'all' | 'income' | 'expense'>('all')
-  const [overviewPeriod, setOverviewPeriod] = useState<PeriodFilter>(() => readHashState().period || 'month')
+  const [overviewPeriod, setOverviewPeriod] = useState<PeriodFilter>(() => parseHash(window.location.hash).period || 'month')
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null)
 
   const navigate = (next: Page) => {
@@ -58,7 +54,7 @@ function App() {
 
   useEffect(() => {
     const onHash = () => {
-      const { page: next, period } = readHashState()
+      const { page: next, period } = parseHash(window.location.hash)
       setPage(next)
       if (period) setOverviewPeriod(period)
     }
@@ -77,6 +73,7 @@ function App() {
     if (!user) return
     api<Dashboard>(`/api/dashboard?period=${overviewPeriod}`).then(setDashboard).catch((error) => notify(error.message))
     api<Transaction[]>('/api/transactions').then(setAllTransactions).catch(() => undefined)
+    api<{ results: Recurring[] }>('/api/recurring').then(({ results }) => setRecurringItems(results)).catch(() => undefined)
   }, [user, refresh, overviewPeriod])
 
   async function logout() {
@@ -90,7 +87,7 @@ function App() {
     try {
       const response = await api<{ user: User }>(isRegister ? '/api/auth/register' : '/api/auth/login', { method: 'POST', body: jsonBody({ email, password }) })
       setUser(response.user)
-      if (response.user.role !== 'admin' && readHashState().page === 'admin') navigate('overview')
+      if (response.user.role !== 'admin' && parseHash(window.location.hash).page === 'admin') navigate('overview')
       notify(isRegister ? 'สร้างบัญชีเรียบร้อยแล้ว' : 'เข้าสู่ระบบสำเร็จ')
     } catch (error) { notify(error instanceof Error ? error.message : 'เข้าสู่ระบบไม่สำเร็จ') }
     finally { setLoading(false) }
@@ -106,6 +103,56 @@ function App() {
 
   const startTransaction = () => { setEditingTransaction(null); setDialog('transaction') }
   const startAccount = (account?: Account) => { setEditingAccount(account || null); setDialog('account') }
+  const startRecurring = (item?: Recurring) => { setEditingRecurring(item || null); setDialog('recurring') }
+  const startBudget = (category?: string) => { setEditingBudget(category ? { category } : null); setDialog('budget') }
+
+  async function saveRecurring(input: { account_id: string; transfer_account_id?: string; type: string; amount: number; category: string; description: string; frequency: 'daily' | 'weekly' | 'monthly'; start_date: string }, recurringId?: string) {
+    await api(recurringId ? `/api/recurring/${recurringId}` : '/api/recurring', { method: recurringId ? 'PATCH' : 'POST', body: jsonBody(recurringId ? { ...input, next_run_date: input.start_date } : input) })
+    setDialog(null)
+    setEditingRecurring(null)
+    notify(recurringId ? 'แก้ไขรายการประจำแล้ว' : 'เพิ่มรายการประจำแล้ว')
+    reload()
+  }
+
+  async function saveBudget(category: string, amount: number) {
+    await api('/api/budgets', { method: 'PUT', body: jsonBody({ category, amount }) })
+    setDialog(null)
+    setEditingBudget(null)
+    notify('บันทึกงบประมาณแล้ว')
+    reload()
+  }
+
+  async function toggleRecurring(item: Recurring) {
+    try {
+      await api(`/api/recurring/${item.id}`, { method: 'PATCH', body: jsonBody({ is_active: !item.is_active }) })
+      notify(item.is_active ? 'หยุดรายการประจำชั่วคราวแล้ว' : 'เริ่มรายการประจำแล้ว')
+      reload()
+    } catch (error) { notify(error instanceof Error ? error.message : 'เปลี่ยนสถานะไม่สำเร็จ') }
+  }
+
+  function deleteRecurring(item: Recurring) {
+    setConfirmRequest({
+      title: 'ลบรายการประจำ',
+      message: `ลบ "${item.description || item.category}" ใช่ไหม? รายการที่สร้างไปแล้วจะไม่ถูกลบ`,
+      confirmLabel: 'ลบรายการประจำ',
+      onConfirm: async () => {
+        try { await api(`/api/recurring/${item.id}`, { method: 'DELETE' }); notify('ลบรายการประจำแล้ว'); reload() }
+        catch (error) { notify(error instanceof Error ? error.message : 'ลบรายการประจำไม่สำเร็จ') }
+      },
+    })
+  }
+
+  function deleteBudget(budget: Budget) {
+    setConfirmRequest({
+      title: 'ลบงบประมาณ',
+      message: `ลบงบประมาณหมวด "${budget.category}" ใช่ไหม?`,
+      confirmLabel: 'ลบงบประมาณ',
+      onConfirm: async () => {
+        try { await api('/api/budgets', { method: 'PUT', body: jsonBody({ category: budget.category, amount: 0 }) }); notify('ลบงบประมาณแล้ว'); reload() }
+        catch (error) { notify(error instanceof Error ? error.message : 'ลบงบประมาณไม่สำเร็จ') }
+      },
+    })
+  }
 
   function deleteTransaction(transaction: Transaction) {
     setConfirmRequest({
@@ -138,7 +185,8 @@ function App() {
     { id: 'overview' as const, label: 'ภาพรวม', icon: LayoutDashboard },
     { id: 'transactions' as const, label: 'รายการทั้งหมด', icon: FileText },
     { id: 'accounts' as const, label: 'บัญชีของฉัน', icon: Wallet },
-    { id: 'settings' as const, label: 'การแจ้งเตือน', icon: Bell },
+    { id: 'recurring' as const, label: 'รายการประจำ', icon: Repeat },
+    { id: 'settings' as const, label: 'การตั้งค่า', icon: Bell },
     ...(user.role === 'admin' ? [{ id: 'admin' as const, label: 'จัดการระบบ', icon: ShieldCheck }] : []),
   ]
 
@@ -171,9 +219,10 @@ function App() {
           </div>
         </header>
 
-        {page === 'overview' && <Overview dashboard={dashboard} period={overviewPeriod} onPeriodChange={(period) => { setOverviewPeriod(period); window.location.hash = `#/overview/${period}` }} onAdd={startTransaction} onNavigate={navigate} />}
+        {page === 'overview' && <Overview dashboard={dashboard} period={overviewPeriod} onPeriodChange={(period) => { setOverviewPeriod(period); window.location.hash = `#/overview/${period}` }} onAdd={startTransaction} onNavigate={navigate} onBudgetAdd={startBudget} onBudgetEdit={(budget) => { setEditingBudget({ category: budget.category, amount: budget.limit }); setDialog('budget') }} onBudgetDelete={deleteBudget} />}
         {page === 'transactions' && <TransactionsPage transactions={allTransactions} query={query} onQuery={setQuery} typeFilter={transactionType} onTypeFilter={setTransactionType} onAdd={startTransaction} onDelete={deleteTransaction} onEdit={(transaction) => { setEditingTransaction(transaction); setDialog('transaction') }} />}
         {page === 'accounts' && <AccountsPage accounts={dashboard.accounts} onAdd={() => startAccount()} onEdit={startAccount} onDelete={deleteAccount} />}
+        {page === 'recurring' && <RecurringPage items={recurringItems} accounts={dashboard.accounts} onAdd={() => startRecurring()} onEdit={startRecurring} onToggle={toggleRecurring} onDelete={deleteRecurring} />}
         {page === 'settings' && <NotificationSettings notify={notify} />}
         {page === 'admin' && user.role === 'admin' && <AdminPage currentUserId={user.id} adminEmail={user.email} notify={notify} />}
         <footer className="page-footer"><span>Ledgerly {APP_VERSION}</span><span>จัดการทุกบาท อย่างสบายใจ</span><span className="footer-status"><i /> ข้อมูลของคุณถูกแยกเก็บอย่างปลอดภัย</span></footer>
@@ -181,6 +230,8 @@ function App() {
 
       {dialog === 'transaction' && <TransactionDialog accounts={dashboard.accounts} existing={editingTransaction || undefined} onClose={() => { setDialog(null); setEditingTransaction(null) }} onSave={saveTransaction} onUploaded={() => { setDialog(null); notify('อ่านและบันทึกสลิปแล้ว'); reload() }} notify={notify} />}
       {dialog === 'account' && <AccountDialog existing={editingAccount || undefined} onClose={() => { setDialog(null); setEditingAccount(null) }} onSaved={() => { setDialog(null); notify(editingAccount ? 'แก้ไขบัญชีแล้ว' : 'เพิ่มบัญชีแล้ว'); setEditingAccount(null); reload() }} notify={notify} />}
+      {dialog === 'recurring' && <RecurringDialog accounts={dashboard.accounts} existing={editingRecurring || undefined} onClose={() => { setDialog(null); setEditingRecurring(null) }} onSave={saveRecurring} notify={notify} />}
+      {dialog === 'budget' && <BudgetDialog category={editingBudget?.category} amount={editingBudget?.amount} editing={editingBudget?.amount !== undefined} knownCategories={dashboard.categories.map((item) => item.category)} onClose={() => { setDialog(null); setEditingBudget(null) }} onSave={saveBudget} notify={notify} />}
       {dialog === 'help' && <HelpDialog onClose={() => setDialog(null)} onNavigate={(target) => { setDialog(null); navigate(target) }} isAdmin={user.role === 'admin'} />}
       {confirmRequest && <ConfirmDialog request={confirmRequest} onClose={() => setConfirmRequest(null)} />}
       {notice && <div className="toast"><Check size={17} />{notice}</div>}

@@ -7,6 +7,7 @@ import { tokenFor } from './lib/credentials'
 import { decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, verifyResetCode } from './lib/credentials'
 import { accountAliasVariants, normalizeAccountName, scoreAccountMatch } from './lib/accountMatch'
 import { effectsDelta, transactionEffects } from './lib/transactions'
+import { advanceRecurringDate, isValidFrequency, isValidRecurringDate } from './lib/recurring'
 
 interface Env {
   DB: D1Database
@@ -23,6 +24,8 @@ interface UserRow extends AuthUser { password_hash: string; is_active: number }
 interface AccountRow { id: string; user_id: string; name: string; type: string; balance: number; currency: string }
 interface TransactionRow { id: string; user_id: string; account_id: string; transfer_account_id: string | null; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string | null; image_url: string | null; image_key: string | null; transaction_date: string }
 interface NotificationRow { user_id: string; gmail_enabled: number; gmail_address: string | null; gmail_app_password_encrypted: string | null; telegram_enabled: number; telegram_bot_token: string | null; telegram_chat_id: string | null; discord_enabled: number; discord_webhook_url: string | null; cron_schedule: string; timezone: string; user_email?: string | null }
+interface RecurringRow { id: string; user_id: string; account_id: string; transfer_account_id: string | null; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string; frequency: 'daily' | 'weekly' | 'monthly'; next_run_date: string; is_active: number }
+interface BudgetRow { id: string; user_id: string; category: string; amount: number }
 
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8' } })
 const fail = (message: string, status = 400) => json({ error: message }, status)
@@ -69,6 +72,13 @@ async function body<T>(request: Request): Promise<T> {
 
 function toClientAccount<T extends { balance: number }>(row: T) { return { ...row, balance: toBaht(row.balance) } }
 function toClientTransaction<T extends { amount: number }>(row: T) { return { ...row, amount: toBaht(row.amount) } }
+
+// Monthly spend per budget category (in satang), used by the dashboard, notifications and exports
+async function budgetSummary(env: Env, userId: string, offsetClause: string, monthStart: string, asOfDate: string) {
+  const rows = await env.DB.prepare("SELECT b.id, b.category, b.amount AS budget_satang, COALESCE(SUM(CASE WHEN t.type = 'expense' THEN t.amount ELSE 0 END), 0) AS spent_satang FROM budgets b LEFT JOIN transactions t ON t.user_id = b.user_id AND t.category = b.category AND date(t.transaction_date, ?) BETWEEN ? AND ? WHERE b.user_id = ? GROUP BY b.id ORDER BY b.category")
+    .bind(offsetClause, monthStart, asOfDate, userId).all<{ id: string; category: string; budget_satang: number; spent_satang: number }>()
+  return rows.results
+}
 
 async function settings(env: Env) {
   const result = await env.DB.prepare('SELECT key, value FROM system_settings').all<{ key: string; value: string }>()
@@ -265,12 +275,14 @@ async function handle(request: Request, env: Env): Promise<Response> {
       start.setUTCDate(1)
     }
     const startDate = start.toISOString().slice(0, 10)
-    const [accounts, recent, totals, categories, trend] = await Promise.all([
+    const monthStart = (() => { const monthDate = new Date(`${endDate}T00:00:00Z`); monthDate.setUTCDate(1); return monthDate.toISOString().slice(0, 10) })()
+    const [accounts, recent, totals, categories, trend, budgets] = await Promise.all([
       env.DB.prepare('SELECT id, name, type, balance, currency FROM accounts WHERE user_id = ? ORDER BY created_at').bind(user.id).all<AccountRow>(),
       env.DB.prepare('SELECT t.*, a.name AS account_name, ta.name AS transfer_account_name FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN accounts ta ON ta.id = t.transfer_account_id WHERE t.user_id = ? ORDER BY t.transaction_date DESC LIMIT 8').bind(user.id).all<{ amount: number } & Record<string, unknown>>(),
       env.DB.prepare("SELECT type, COALESCE(SUM(amount), 0) AS total FROM transactions WHERE user_id = ? AND date(transaction_date, ?) >= ? AND type IN ('income', 'expense') GROUP BY type").bind(user.id, offsetClause, startDate).all<{ type: string; total: number }>(),
       env.DB.prepare("SELECT category, SUM(amount) AS total FROM transactions WHERE user_id = ? AND type = 'expense' AND date(transaction_date, ?) >= ? GROUP BY category ORDER BY total DESC LIMIT 5").bind(user.id, offsetClause, startDate).all(),
       env.DB.prepare("WITH RECURSIVE days(day) AS (SELECT ? UNION ALL SELECT date(day, '+1 day') FROM days WHERE day < ?) SELECT strftime('%d', days.day) AS day, COALESCE(SUM(t.amount), 0) AS total FROM days LEFT JOIN transactions t ON t.user_id = ? AND t.type = 'expense' AND date(t.transaction_date, ?) = days.day GROUP BY days.day ORDER BY days.day").bind(startDate, endDate, user.id, offsetClause).all<{ day: string; total: number }>(),
+      budgetSummary(env, user.id, offsetClause, monthStart, endDate),
     ])
     const totalsByType = Object.fromEntries(totals.results.map((row) => [row.type, row.total]))
     return json({
@@ -280,6 +292,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       expense: toBaht(totalsByType.expense || 0),
       categories: categories.results.map((row) => ({ category: String(row.category), total: toBaht(Number(row.total)) })),
       trend: trend.results.map((row) => ({ day: row.day, total: toBaht(row.total) })),
+      budgets: budgets.map((row) => ({ category: row.category, limit: toBaht(row.budget_satang), spent: toBaht(row.spent_satang) })),
       period,
       balance: accounts.results.reduce((sum, account) => sum + toBaht(account.balance), 0),
     })
@@ -364,6 +377,104 @@ async function handle(request: Request, env: Env): Promise<Response> {
     ])
     if (old.image_key && env.RECEIPTS) await env.RECEIPTS.delete(old.image_key)
     return json({ ok: true })
+  }
+
+  if (path === '/api/recurring' && method === 'GET') {
+    const rows = await env.DB.prepare('SELECT r.*, a.name AS account_name, ta.name AS transfer_account_name FROM recurring_transactions r JOIN accounts a ON a.id = r.account_id LEFT JOIN accounts ta ON ta.id = r.transfer_account_id WHERE r.user_id = ? ORDER BY r.created_at DESC').bind(user.id).all<{ amount: number } & Record<string, unknown>>()
+    return json({ ...rows, results: rows.results.map(toClientTransaction) })
+  }
+  if (path === '/api/recurring' && method === 'POST') {
+    const input = await body<{ account_id: string; transfer_account_id?: string; type: string; amount: number; category: string; description?: string; frequency: string; start_date?: string }>(request)
+    if (!['income', 'expense', 'transfer'].includes(input.type) || !isValidFrequency(input.frequency)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
+    const amountSatang = toSatang(input.amount)
+    if (!(amountSatang > 0) || !input.category?.trim()) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
+    if (!await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(input.account_id, user.id).first()) return fail('ไม่พบบัญชี', 404)
+    let destination: string | null = null
+    if (input.type === 'transfer') {
+      destination = input.transfer_account_id || ''
+      if (!destination || destination === input.account_id) return fail('กรุณาเลือกบัญชีปลายทางที่ต่างจากบัญชีต้นทาง')
+      if (!await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(destination, user.id).first()) return fail('ไม่พบบัญชีปลายทาง', 404)
+    }
+    if (input.start_date !== undefined && !isValidRecurringDate(input.start_date)) return fail('วันที่เริ่มต้นไม่ถูกต้อง')
+    const nextRun = input.start_date || dateInTz('Asia/Bangkok')
+    const rowId = id()
+    await env.DB.prepare('INSERT INTO recurring_transactions (id, user_id, account_id, transfer_account_id, type, amount, category, description, frequency, next_run_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(rowId, user.id, input.account_id, destination, input.type, amountSatang, input.category.trim(), input.description || '', input.frequency, nextRun).run()
+    const row = await env.DB.prepare('SELECT id, account_id, transfer_account_id, type, amount, category, description, frequency, next_run_date, is_active FROM recurring_transactions WHERE id = ? AND user_id = ?').bind(rowId, user.id).first<{ amount: number } & Record<string, unknown>>()
+    return json(row ? toClientTransaction(row) : row, 201)
+  }
+  const recurringMatch = path.match(/^\/api\/recurring\/([^/]+)$/)
+  if (recurringMatch && (method === 'PATCH' || method === 'DELETE')) {
+    const old = await env.DB.prepare('SELECT * FROM recurring_transactions WHERE id = ? AND user_id = ?').bind(recurringMatch[1], user.id).first<RecurringRow>()
+    if (!old) return fail('ไม่พบรายการประจำ', 404)
+    if (method === 'DELETE') {
+      await env.DB.prepare('DELETE FROM recurring_transactions WHERE id = ? AND user_id = ?').bind(old.id, user.id).run()
+      return json({ ok: true })
+    }
+    const input = await body<Partial<RecurringRow>>(request)
+    const next = {
+      account_id: input.account_id || old.account_id,
+      type: input.type || old.type,
+      amount: input.amount === undefined ? Number(old.amount) : toSatang(input.amount),
+      category: input.category || old.category,
+      description: input.description ?? old.description,
+      frequency: isValidFrequency(input.frequency) ? input.frequency : old.frequency,
+      next_run_date: input.next_run_date === undefined ? old.next_run_date : input.next_run_date,
+      is_active: input.is_active === undefined ? old.is_active : (input.is_active ? 1 : 0),
+    }
+    if (!(next.amount > 0) || !Number.isFinite(next.amount) || !Number.isInteger(next.amount) || !['income', 'expense', 'transfer'].includes(next.type)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
+    if (input.next_run_date !== undefined && !isValidRecurringDate(input.next_run_date)) return fail('วันที่เริ่มต้นไม่ถูกต้อง')
+    if (next.type === 'transfer' && (!input.transfer_account_id && !old.transfer_account_id)) return fail('กรุณาเลือกบัญชีปลายทาง')
+    const destination = next.type === 'transfer' ? (input.transfer_account_id ?? old.transfer_account_id ?? '') : null
+    if (next.type === 'transfer' && (!destination || destination === next.account_id)) return fail('กรุณาเลือกบัญชีปลายทางที่ต่างจากบัญชีต้นทาง')
+    if (!await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(next.account_id, user.id).first()) return fail('ไม่พบบัญชี', 404)
+    if (next.type === 'transfer' && !await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(destination!, user.id).first()) return fail('ไม่พบบัญชีปลายทาง', 404)
+    const updates = await env.DB.prepare('UPDATE recurring_transactions SET account_id = ?, transfer_account_id = ?, type = ?, amount = ?, category = ?, description = ?, frequency = ?, next_run_date = ?, is_active = ? WHERE id = ? AND user_id = ?')
+      .bind(next.account_id, destination, next.type, next.amount, next.category, next.description, next.frequency, next.next_run_date, next.is_active, old.id, user.id).run()
+    return updates.meta.changes ? json({ ok: true }) : fail('แก้ไขรายการประจำไม่สำเร็จ')
+  }
+
+  if (path === '/api/budgets' && method === 'PUT') {
+    const input = await body<{ category: string; amount: number }>(request)
+    const category = input.category?.trim()
+    if (!category || category.length > 60) return fail('กรุณาระบุหมวดหมู่งบประมาณ')
+    const amountSatang = toSatang(input.amount)
+    if (!Number.isFinite(amountSatang) || amountSatang < 0) return fail('ยอดงบประมาณไม่ถูกต้อง')
+    if (!amountSatang) {
+      await env.DB.prepare('DELETE FROM budgets WHERE user_id = ? AND category = ?').bind(user.id, category).run()
+      return json({ ok: true, removed: true })
+    }
+    await env.DB.prepare('INSERT INTO budgets (id, user_id, category, amount) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, category) DO UPDATE SET amount = excluded.amount')
+      .bind(id(), user.id, category, amountSatang).run()
+    return json({ ok: true })
+  }
+
+  if (path === '/api/export' && method === 'GET') {
+    const [accounts, transactions, recurring, budgets] = await Promise.all([
+      env.DB.prepare('SELECT * FROM accounts WHERE user_id = ? ORDER BY created_at').bind(user.id).all<AccountRow>(),
+      env.DB.prepare('SELECT t.*, a.name AS account_name, ta.name AS transfer_account_name FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN accounts ta ON ta.id = t.transfer_account_id WHERE t.user_id = ? ORDER BY t.transaction_date').bind(user.id).all<{ amount: number } & Record<string, unknown>>(),
+      env.DB.prepare('SELECT r.*, a.name AS account_name, ta.name AS transfer_account_name FROM recurring_transactions r JOIN accounts a ON a.id = r.account_id LEFT JOIN accounts ta ON ta.id = r.transfer_account_id WHERE r.user_id = ? ORDER BY r.created_at').bind(user.id).all<{ amount: number } & Record<string, unknown>>(),
+      env.DB.prepare('SELECT category, amount FROM budgets WHERE user_id = ? ORDER BY category').bind(user.id).all<BudgetRow>(),
+    ])
+    const stamp = new Date().toISOString().slice(0, 10)
+    if (url.searchParams.get('format') === 'csv') {
+      const escape = (value: unknown) => `"${String(value ?? '').replace(/"/g, '""')}"`
+      const lines = ['วันที่,ประเภท,หมวดหมู่,รายละเอียด,บัญชี,บัญชีปลายทาง,จำนวนเงิน (บาท)']
+      for (const row of transactions.results) {
+        const client = toClientTransaction(row)
+        lines.push([row.transaction_date, row.type, row.category, row.description, row.account_name, row.transfer_account_name || '', client.amount].map(escape).join(','))
+      }
+      // BOM so Thai text opens correctly in Excel
+      return new Response(`\uFEFF${lines.join('\r\n')}`, { headers: { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': `attachment; filename="ledgerly-transactions-${stamp}.csv"` } })
+    }
+    const payload = {
+      exported_at: new Date().toISOString(),
+      accounts: accounts.results.map(toClientAccount),
+      transactions: transactions.results.map(toClientTransaction),
+      recurring: recurring.results.map(toClientTransaction),
+      budgets: budgets.results.map((row) => ({ ...row, amount: toBaht(row.amount) })),
+    }
+    return new Response(JSON.stringify(payload, null, 2), { headers: { 'content-type': 'application/json; charset=utf-8', 'content-disposition': `attachment; filename="ledgerly-backup-${stamp}.json"` } })
   }
 
   if (path === '/api/ai/parse' && method === 'POST') {
@@ -615,7 +726,18 @@ async function dispatchNotification(env: Env, row: NotificationRow) {
   const period = scheduleType === 'weekly' ? `${formatDate(startDate)} - ${formatDate(endDate)}` : scheduleType === 'monthly' ? `${formatDate(startDate)} - ${formatDate(endDate)}` : formatDate(endDate)
   const label = scheduleType === 'daily' ? 'ประจำวัน' : scheduleType === 'weekly' ? 'ประจำสัปดาห์' : 'ประจำเดือน'
   const bahtLabel = (value: unknown) => (Number(value || 0) / 100).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
-  const summary = `สรุปรายรับรายจ่าย${label} ${period}\nรายรับ ${bahtLabel(values.income)} บาท\nรายจ่าย ${bahtLabel(values.expense)} บาท`
+  let summary = `สรุปรายรับรายจ่าย${label} ${period}\nรายรับ ${bahtLabel(values.income)} บาท\nรายจ่าย ${bahtLabel(values.expense)} บาท`
+  const monthStart = (() => { const monthDate = new Date(`${endDate}T00:00:00Z`); monthDate.setUTCDate(1); return monthDate.toISOString().slice(0, 10) })()
+  try {
+    const budgetRows = await budgetSummary(env, row.user_id, `+${tzOffsetMinutes(row.timezone)} minutes`, monthStart, endDate)
+    if (budgetRows.length) {
+      const lines = budgetRows.map((budget) => {
+        const percent = budget.budget_satang > 0 ? Math.round((budget.spent_satang / budget.budget_satang) * 100) : 0
+        return `${percent >= 90 ? '⚠️' : '•'} ${budget.category}: ${bahtLabel(budget.spent_satang)} / ${bahtLabel(budget.budget_satang)} บาท (${percent}%)`
+      })
+      summary += `\n\nงบประมาณรายเดือน\n${lines.join('\n')}`
+    }
+  } catch (error) { console.error('Budget summary failed:', error) }
   const telegramToken = await maybeDecrypt(row.telegram_bot_token, env.ENCRYPTION_KEY)
   const discordWebhookUrl = await maybeDecrypt(row.discord_webhook_url, env.ENCRYPTION_KEY)
   const tasks: Promise<unknown>[] = []
@@ -627,7 +749,38 @@ async function dispatchNotification(env: Env, row: NotificationRow) {
   return outcomes
 }
 
+// Claiming the due date and applying its transaction share one D1 batch, so a
+// failed or interrupted write cannot skip the occurrence or duplicate it.
+async function materializeRecurring(env: Env) {
+  const rows = await env.DB.prepare('SELECT r.*, n.timezone AS timezone FROM recurring_transactions r JOIN users u ON u.id = r.user_id LEFT JOIN user_notification_settings n ON n.user_id = r.user_id WHERE r.is_active = 1 AND u.is_active = 1').all<RecurringRow & { timezone?: string }>()
+  for (const row of rows.results) {
+    const today = dateInTz(row.timezone || 'Asia/Bangkok')
+    let next = row.next_run_date
+    let guard = 0
+    while (next <= today && guard < 400) {
+      guard++
+      const following = advanceRecurringDate(next, row.frequency)
+      try {
+        const transactionId = id()
+        const statements = [
+          env.DB.prepare('UPDATE recurring_transactions SET next_run_date = ? WHERE id = ? AND user_id = ? AND next_run_date = ?').bind(following, row.id, row.user_id, next),
+          env.DB.prepare('INSERT INTO transactions (id, user_id, account_id, transfer_account_id, type, amount, category, description, image_url, image_key, transaction_date) SELECT ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ? WHERE changes() = 1')
+            .bind(transactionId, row.user_id, row.account_id, row.type === 'transfer' ? row.transfer_account_id : null, row.type, row.amount, row.category, row.description || '', `${next}T05:00:00.000Z`),
+          ...transactionEffects(row).map((effect) => env.DB.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ? AND user_id = ? AND EXISTS (SELECT 1 FROM transactions WHERE id = ? AND user_id = ?)').bind(effect.delta, effect.account_id, row.user_id, transactionId, row.user_id)),
+        ]
+        const result = await env.DB.batch(statements)
+        if (result.some((statement) => !statement.success)) throw new Error('Could not materialize recurring transaction')
+      } catch (error) {
+        console.error(`Recurring transaction ${row.id} failed; it will retry:`, error)
+        break
+      }
+      next = following
+    }
+  }
+}
+
 async function runScheduled(env: Env) {
+  await materializeRecurring(env)
   const users = await env.DB.prepare('SELECT n.*, u.email AS user_email FROM user_notification_settings n JOIN users u ON u.id = n.user_id WHERE u.is_active = 1 AND (n.gmail_enabled = 1 OR n.telegram_enabled = 1 OR n.discord_enabled = 1)').all<NotificationRow>()
   const now = new Date()
   await Promise.allSettled(users.results.filter((row) => cronMatches(row.cron_schedule, now, row.timezone)).map((row) => dispatchNotification(env, row)))

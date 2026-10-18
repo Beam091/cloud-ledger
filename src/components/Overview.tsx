@@ -1,13 +1,14 @@
 import { ArrowDownLeft, ArrowRight, ArrowUpRight, ChevronDown, CreditCard, Plus, TrendingDown, Wallet } from 'lucide-react'
 import { lazy, Suspense } from 'react'
 import { accountKinds, categoryMarks, money } from '../lib/format'
-import type { Dashboard, Page, PeriodFilter } from '../types'
+import type { Budget, Dashboard, Page, PeriodFilter } from '../types'
 import { EmptyState } from './EmptyState'
+import { BudgetPanel } from './BudgetPanel'
 import { TransactionTable } from './TransactionsPage'
 
 const SpendChart = lazy(() => import('./SpendChart'))
 
-export function Overview({ dashboard, period, onPeriodChange, onAdd, onNavigate }: { dashboard: Dashboard; period: PeriodFilter; onPeriodChange: (period: PeriodFilter) => void; onAdd: () => void; onNavigate: (page: Page) => void }) {
+export function Overview({ dashboard, period, onPeriodChange, onAdd, onNavigate, onBudgetAdd, onBudgetEdit, onBudgetDelete }: { dashboard: Dashboard; period: PeriodFilter; onPeriodChange: (period: PeriodFilter) => void; onAdd: () => void; onNavigate: (page: Page) => void; onBudgetAdd: (category?: string) => void; onBudgetEdit: (budget: Budget) => void; onBudgetDelete: (budget: Budget) => void }) {
   const periodLabels = { day: 'วันนี้', week: 'สัปดาห์นี้', month: 'เดือนนี้' }
   const chartData = dashboard.trend.map((item) => ({
     name: period === 'day' ? 'วันนี้' : period === 'week'
@@ -26,6 +27,7 @@ export function Overview({ dashboard, period, onPeriodChange, onAdd, onNavigate 
       <section className="accounts-panel"><div className="section-top"><div><span className="section-kicker">FINANCIAL ACCOUNTS</span><h2>บัญชีของฉัน <span className="count-pill">{dashboard.accounts.length}</span></h2></div><button className="text-link" onClick={() => onNavigate('accounts')}>ดูทั้งหมด <ArrowRight size={14} /></button></div>{dashboard.accounts.length ? <div className="account-list">{dashboard.accounts.slice(0, 3).map((account, index) => <AccountRow key={account.id} account={account} index={index} />)}</div> : <EmptyState title="ยังไม่มีบัญชี" detail="เพิ่มบัญชีแรกเพื่อเริ่มจัดการเงิน" />}</section>
       <section className="category-panel"><div className="section-top"><div><span className="section-kicker">SPENDING BREAKDOWN</span><h2>หมวดหมู่ยอดนิยม</h2></div><button className="more-quiet" aria-label="ดูรายการทั้งหมด" title="ดูรายการทั้งหมด" onClick={() => onNavigate('transactions')}><ArrowRight size={16} /></button></div>{dashboard.categories.length ? <div className="category-list">{dashboard.categories.map((item, index) => <div className="category-row" key={item.category}><span className="category-glyph" style={{ background: ['#f6ece2', '#edf1e8', '#f7f2df', '#eaf0ed', '#f3e9e4'][index % 5], color: ['#c47d48', '#6b876f', '#b89a46', '#628377', '#ad745e'][index % 5] }}>{categoryMarks[item.category] || item.category.slice(0, 1)}</span><span className="category-name">{item.category}</span><span className="category-amount">฿ {money(item.total)}</span></div>)}</div> : <EmptyState title={`ยังไม่มีข้อมูล${periodLabels[period]}`} detail="รายการใช้จ่ายจะแสดงตรงนี้" />}</section>
     </div>
+    <BudgetPanel budgets={dashboard.budgets || []} categories={dashboard.categories.map((item) => item.category)} onAdd={onBudgetAdd} onEdit={onBudgetEdit} onDelete={onBudgetDelete} />
     <section className="transactions-panel"><div className="section-top transaction-section-top"><div><span className="section-kicker">RECENT ACTIVITY</span><h2>รายการล่าสุด</h2></div><button className="text-link" onClick={() => onNavigate('transactions')}>ดูรายการทั้งหมด <ArrowRight size={14} /></button></div><TransactionTable transactions={dashboard.transactions} compact /></section>
   </section>
 }

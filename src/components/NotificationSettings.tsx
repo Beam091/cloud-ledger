@@ -1,6 +1,6 @@
-import { Bell, Check, Clock3, LoaderCircle, LockKeyhole, Mail } from 'lucide-react'
+import { Bell, Check, Clock3, Download, FileSpreadsheet, LoaderCircle, LockKeyhole, Mail } from 'lucide-react'
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
-import { api, jsonBody } from '../api'
+import { api, API_BASE_URL, jsonBody } from '../api'
 
 const notificationScheduleOptions = [
   { label: 'รายวัน', value: '0 21 * * *' },
@@ -27,7 +27,7 @@ export function NotificationSettings({ notify }: { notify: (message: string) => 
   }
   const scheduleValue = String(form.cron_schedule || '0 21 * * *')
   return <section className="page-body">
-    <div className="page-heading"><div><p className="eyebrow">STAY IN THE KNOW</p><h1>การแจ้งเตือน</h1><p className="heading-sub">เลือกช่องทางและเวลารับสรุปการเงิน</p></div></div>
+    <div className="page-heading"><div><p className="eyebrow">PREFERENCES & DATA</p><h1>การตั้งค่า</h1><p className="heading-sub">การแจ้งเตือนและการเก็บข้อมูลของคุณ</p></div></div>
     <form className="settings-form" onSubmit={save}>
       <div className="settings-intro"><span className="settings-intro-icon"><Bell size={19} /></span><div><b>{getNotificationScheduleLabel(scheduleValue)}</b><p>รับภาพรวมรายรับและรายจ่ายตามเวลาที่คุณเลือก</p></div><label className="time-select"><Clock3 size={15} /><select aria-label="เลือกช่วงเวลาส่งสรุป" value={scheduleValue} onChange={(event) => set('cron_schedule', event.target.value)}><option value="0 21 * * *">รายวัน</option><option value="0 21 * * 1">รายสัปดาห์</option><option value="0 21 1 * *">รายเดือน</option></select><small>ช่วงเวลา</small></label></div>
       <div className="channel-list">
@@ -36,6 +36,14 @@ export function NotificationSettings({ notify }: { notify: (message: string) => 
         <ChannelCard icon={<span className="discord-glyph">◉</span>} title="Discord" description="ส่ง Rich Embed ไปยังเซิร์ฟเวอร์ของคุณ" enabled={Boolean(form.discord_enabled)} onEnabled={(value) => set('discord_enabled', value)}><div className="settings-fields"><label>Webhook URL<input type="url" placeholder={form.discord_webhook_set ? 'บันทึกไว้อย่างปลอดภัยแล้ว' : 'https://discord.com/api/webhooks/...'} onChange={(event) => set('discord_webhook_url', event.target.value)} /></label></div></ChannelCard>
       </div>
       <div className="settings-save-row"><span>ตั้งค่าเขตเวลาเป็น Asia/Bangkok</span><button className="primary-button" disabled={busy}>{busy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />} บันทึกการตั้งค่า</button></div>
+      <div className="data-card">
+        <span className="data-card-icon"><Download size={19} /></span>
+        <div className="data-copy"><b>ข้อมูลของฉัน</b><p>สำรองรายการ บัญชี รายการประจำ และงบประมาณเป็นไฟล์ JSON (สำรองไว้ยืมหลัง) หรือ CSV สำหรับเปิดในโปรแกรมตารางงาน</p></div>
+        <div className="data-actions">
+          <a className="outline-button" href={`${API_BASE_URL}/api/export?format=csv`} download><FileSpreadsheet size={15} /> CSV</a>
+          <a className="primary-button" href={`${API_BASE_URL}/api/export?format=json`} download><Download size={15} /> JSON Backup</a>
+        </div>
+      </div>
     </form>
   </section>
 }

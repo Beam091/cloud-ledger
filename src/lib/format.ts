@@ -1,4 +1,4 @@
-export const APP_VERSION = 'v1.0.9'
+export const APP_VERSION = 'v1.0.10'
 
 export const money = (amount: number) => new Intl.NumberFormat('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(amount)
 export const dateLabel = (value: string) => new Intl.DateTimeFormat('th-TH', { day: 'numeric', month: 'short' }).format(new Date(value))
