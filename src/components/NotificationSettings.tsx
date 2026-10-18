@@ -38,7 +38,7 @@ export function NotificationSettings({ notify }: { notify: (message: string) => 
       <div className="settings-save-row"><span>ตั้งค่าเขตเวลาเป็น Asia/Bangkok</span><button className="primary-button" disabled={busy}>{busy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />} บันทึกการตั้งค่า</button></div>
       <div className="data-card">
         <span className="data-card-icon"><Download size={19} /></span>
-        <div className="data-copy"><b>ข้อมูลของฉัน</b><p>สำรองรายการ บัญชี รายการประจำ และงบประมาณเป็นไฟล์ JSON (สำรองไว้ยืมหลัง) หรือ CSV สำหรับเปิดในโปรแกรมตารางงาน</p></div>
+        <div className="data-copy"><b>ข้อมูลของฉัน</b><p>สำรองรายการ บัญชี รายการประจำ และงบประมาณเป็นไฟล์ JSON (สำรองไว้ภายหลัง) หรือ CSV สำหรับเปิดในโปรแกรมตารางงาน</p></div>
         <div className="data-actions">
           <a className="outline-button" href={`${API_BASE_URL}/api/export?format=csv`} download><FileSpreadsheet size={15} /> CSV</a>
           <a className="primary-button" href={`${API_BASE_URL}/api/export?format=json`} download><Download size={15} /> JSON Backup</a>
