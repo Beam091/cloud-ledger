@@ -225,6 +225,13 @@ async function parseWithAI(env: Env, input: string, image?: { mimeType: string; 
 
 function signedAmount(type: string, amount: number) { return type === 'income' ? amount : -amount }
 
+// Money is stored in D1 as INTEGER satang (1/100 THB); the API keeps baht decimals.
+const SATANG_PER_BAHT = 100
+function toSatang(baht: number) { return Math.round(Number(baht) * SATANG_PER_BAHT) }
+function toBaht(satang: number) { return Number(satang) / SATANG_PER_BAHT }
+function toClientAccount<T extends { balance: number }>(row: T) { return { ...row, balance: toBaht(row.balance) } }
+function toClientTransaction<T extends { amount: number }>(row: T) { return { ...row, amount: toBaht(row.amount) } }
+
 function dateInTz(timezone: string, date = new Date()) {
   try {
     return new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(date)
@@ -244,13 +251,16 @@ function tzOffsetMinutes(timezone: string) {
 async function createTransaction(env: Env, user: AuthUser, data: Omit<TransactionRow, 'id' | 'user_id' | 'image_url' | 'image_key'> & { image_url?: string | null; image_key?: string | null }) {
   const account = await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(data.account_id, user.id).first()
   if (!account) throw new Error('Account not found')
+  const amountSatang = toSatang(data.amount)
+  if (!Number.isInteger(amountSatang) || amountSatang <= 0) throw new Error('จำนวนเงินไม่ถูกต้อง')
   const transactionId = id()
   const batch = await env.DB.batch([
-    env.DB.prepare('INSERT INTO transactions (id, user_id, account_id, type, amount, category, description, image_url, image_key, transaction_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(transactionId, user.id, data.account_id, data.type, data.amount, data.category, data.description, data.image_url ?? null, data.image_key ?? null, data.transaction_date || new Date().toISOString()),
-    env.DB.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ? AND user_id = ?').bind(signedAmount(data.type, data.amount), data.account_id, user.id),
+    env.DB.prepare('INSERT INTO transactions (id, user_id, account_id, type, amount, category, description, image_url, image_key, transaction_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').bind(transactionId, user.id, data.account_id, data.type, amountSatang, data.category, data.description, data.image_url ?? null, data.image_key ?? null, data.transaction_date || new Date().toISOString()),
+    env.DB.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ? AND user_id = ?').bind(signedAmount(data.type, amountSatang), data.account_id, user.id),
   ])
   if (batch.some((result) => !result.success)) throw new Error('Could not save transaction')
-  return env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(transactionId, user.id).first()
+  const row = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(transactionId, user.id).first<{ amount: number } & Record<string, unknown>>()
+  return row ? toClientTransaction(row) : row
 }
 
 function cors(response: Response, origin: string) {
@@ -362,22 +372,37 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const startDate = start.toISOString().slice(0, 10)
     const [accounts, recent, totals, categories, trend] = await Promise.all([
       env.DB.prepare('SELECT id, name, type, balance, currency FROM accounts WHERE user_id = ? ORDER BY created_at').bind(user.id).all<AccountRow>(),
-      env.DB.prepare('SELECT t.*, a.name AS account_name FROM transactions t JOIN accounts a ON a.id = t.account_id WHERE t.user_id = ? ORDER BY t.transaction_date DESC LIMIT 8').bind(user.id).all(),
+      env.DB.prepare('SELECT t.*, a.name AS account_name FROM transactions t JOIN accounts a ON a.id = t.account_id WHERE t.user_id = ? ORDER BY t.transaction_date DESC LIMIT 8').bind(user.id).all<{ amount: number } & Record<string, unknown>>(),
       env.DB.prepare("SELECT type, COALESCE(SUM(amount), 0) AS total FROM transactions WHERE user_id = ? AND date(transaction_date, ?) >= ? AND type IN ('income', 'expense') GROUP BY type").bind(user.id, offsetClause, startDate).all<{ type: string; total: number }>(),
       env.DB.prepare("SELECT category, SUM(amount) AS total FROM transactions WHERE user_id = ? AND type = 'expense' AND date(transaction_date, ?) >= ? GROUP BY category ORDER BY total DESC LIMIT 5").bind(user.id, offsetClause, startDate).all(),
       env.DB.prepare("WITH RECURSIVE days(day) AS (SELECT ? UNION ALL SELECT date(day, '+1 day') FROM days WHERE day < ?) SELECT strftime('%d', days.day) AS day, COALESCE(SUM(t.amount), 0) AS total FROM days LEFT JOIN transactions t ON t.user_id = ? AND t.type = 'expense' AND date(t.transaction_date, ?) = days.day GROUP BY days.day ORDER BY days.day").bind(startDate, endDate, user.id, offsetClause).all<{ day: string; total: number }>(),
     ])
     const totalsByType = Object.fromEntries(totals.results.map((row) => [row.type, row.total]))
-    return json({ accounts: accounts.results, transactions: recent.results, income: totalsByType.income || 0, expense: totalsByType.expense || 0, categories: categories.results, trend: trend.results, period, balance: accounts.results.reduce((sum, account) => sum + account.balance, 0) })
+    return json({
+      accounts: accounts.results.map(toClientAccount),
+      transactions: recent.results.map(toClientTransaction),
+      income: toBaht(totalsByType.income || 0),
+      expense: toBaht(totalsByType.expense || 0),
+      categories: categories.results.map((row) => ({ category: String(row.category), total: toBaht(Number(row.total)) })),
+      trend: trend.results.map((row) => ({ day: row.day, total: toBaht(row.total) })),
+      period,
+      balance: accounts.results.reduce((sum, account) => sum + toBaht(account.balance), 0),
+    })
   }
 
-  if (path === '/api/accounts' && method === 'GET') return json(await env.DB.prepare('SELECT * FROM accounts WHERE user_id = ? ORDER BY created_at').bind(user.id).all())
+  if (path === '/api/accounts' && method === 'GET') {
+    const rows = await env.DB.prepare('SELECT * FROM accounts WHERE user_id = ? ORDER BY created_at').bind(user.id).all<AccountRow & Record<string, unknown>>()
+    return json({ ...rows, results: rows.results.map(toClientAccount) })
+  }
   if (path === '/api/accounts' && method === 'POST') {
     const input = await body<{ name: string; type: string; balance?: number }>(request)
     if (!input.name?.trim() || !['bank', 'e_wallet', 'cash', 'other'].includes(input.type)) return fail('ข้อมูลบัญชีไม่ถูกต้อง')
+    const openingBalance = Number(input.balance || 0)
+    if (!Number.isFinite(openingBalance)) return fail('ยอดเงินเริ่มต้นไม่ถูกต้อง')
     const accountId = id()
-    await env.DB.prepare('INSERT INTO accounts (id, user_id, name, type, balance) VALUES (?, ?, ?, ?, ?)').bind(accountId, user.id, input.name.trim(), input.type, Number(input.balance || 0)).run()
-    return json(await env.DB.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?').bind(accountId, user.id).first(), 201)
+    await env.DB.prepare('INSERT INTO accounts (id, user_id, name, type, balance) VALUES (?, ?, ?, ?, ?)').bind(accountId, user.id, input.name.trim(), input.type, toSatang(openingBalance)).run()
+    const row = await env.DB.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?').bind(accountId, user.id).first<{ balance: number } & Record<string, unknown>>()
+    return json(row ? toClientAccount(row) : null, 201)
   }
   const accountMatch = path.match(/^\/api\/accounts\/([^/]+)$/)
   if (accountMatch && method === 'PATCH') {
@@ -399,28 +424,35 @@ async function handle(request: Request, env: Env): Promise<Response> {
 
   if (path === '/api/transactions' && method === 'GET') {
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 100), 1), 500)
-    const rows = await env.DB.prepare('SELECT t.*, a.name AS account_name FROM transactions t JOIN accounts a ON a.id = t.account_id WHERE t.user_id = ? ORDER BY t.transaction_date DESC LIMIT ?').bind(user.id, limit).all()
-    return json(rows.results)
+    const rows = await env.DB.prepare('SELECT t.*, a.name AS account_name FROM transactions t JOIN accounts a ON a.id = t.account_id WHERE t.user_id = ? ORDER BY t.transaction_date DESC LIMIT ?').bind(user.id, limit).all<{ amount: number } & Record<string, unknown>>()
+    return json({ ...rows, results: rows.results.map(toClientTransaction) })
   }
   if (path === '/api/transactions' && method === 'POST') {
     const input = await body<{ account_id: string; type: 'income' | 'expense'; amount: number; category: string; description?: string; transaction_date?: string }>(request)
     if (!(input.amount > 0) || !['income', 'expense'].includes(input.type) || !input.category?.trim()) return fail('ข้อมูลรายการไม่ถูกต้อง')
-    return json(await createTransaction(env, user, { ...input, description: input.description || '', transaction_date: input.transaction_date || new Date().toISOString() }), 201)
+    try {
+      return json(await createTransaction(env, user, { ...input, description: input.description || '', transaction_date: input.transaction_date || new Date().toISOString() }), 201)
+    } catch (error) {
+      console.error('Create transaction failed:', error)
+      return fail('ไม่สามารถบันทึกรายการได้ กรุณาตรวจสอบบัญชีที่เลือก', 422)
+    }
   }
   const transactionMatch = path.match(/^\/api\/transactions\/([^/]+)$/)
   if (transactionMatch && method === 'PATCH') {
     const old = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(transactionMatch[1], user.id).first<TransactionRow>()
     if (!old) return fail('ไม่พบรายการ', 404)
     const input = await body<Partial<TransactionRow>>(request)
-    const next = { account_id: input.account_id || old.account_id, type: input.type || old.type, amount: input.amount ?? old.amount, category: input.category || old.category, description: input.description ?? old.description, transaction_date: input.transaction_date || old.transaction_date }
-    if (!(next.amount > 0) || !['income', 'expense'].includes(next.type)) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    const nextAmount = input.amount === undefined ? Number(old.amount) : toSatang(input.amount)
+    const next = { account_id: input.account_id || old.account_id, type: input.type || old.type, amount: nextAmount, category: input.category || old.category, description: input.description ?? old.description, transaction_date: input.transaction_date || old.transaction_date }
+    if (!(next.amount > 0) || !Number.isInteger(next.amount) || !['income', 'expense'].includes(next.type)) return fail('ข้อมูลรายการไม่ถูกต้อง')
     if (!await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(next.account_id, user.id).first()) return fail('ไม่พบบัญชี', 404)
     await env.DB.batch([
       env.DB.prepare('UPDATE accounts SET balance = balance - ? WHERE id = ? AND user_id = ?').bind(signedAmount(old.type, old.amount), old.account_id, user.id),
       env.DB.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ? AND user_id = ?').bind(signedAmount(next.type, next.amount), next.account_id, user.id),
       env.DB.prepare('UPDATE transactions SET account_id = ?, type = ?, amount = ?, category = ?, description = ?, transaction_date = ? WHERE id = ? AND user_id = ?').bind(next.account_id, next.type, next.amount, next.category, next.description, next.transaction_date, old.id, user.id),
     ])
-    return json(await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(old.id, user.id).first())
+    const row = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(old.id, user.id).first<{ amount: number } & Record<string, unknown>>()
+    return json(row ? toClientTransaction(row) : row)
   }
   if (transactionMatch && method === 'DELETE') {
     const old = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(transactionMatch[1], user.id).first<TransactionRow>()
@@ -718,7 +750,8 @@ async function dispatchNotification(env: Env, row: NotificationRow) {
   const formatDate = (value: string) => new Intl.DateTimeFormat('th-TH', { timeZone: row.timezone || 'Asia/Bangkok', day: 'numeric', month: 'short', year: 'numeric' }).format(new Date(`${value}T12:00:00Z`))
   const period = scheduleType === 'weekly' ? `${formatDate(startDate)} - ${formatDate(endDate)}` : scheduleType === 'monthly' ? `${formatDate(startDate)} - ${formatDate(endDate)}` : formatDate(endDate)
   const label = scheduleType === 'daily' ? 'ประจำวัน' : scheduleType === 'weekly' ? 'ประจำสัปดาห์' : 'ประจำเดือน'
-  const summary = `สรุปรายรับรายจ่าย${label} ${period}\nรายรับ ${Number(values.income || 0).toLocaleString('th-TH')} บาท\nรายจ่าย ${Number(values.expense || 0).toLocaleString('th-TH')} บาท`
+  const bahtLabel = (value: unknown) => (Number(value || 0) / 100).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  const summary = `สรุปรายรับรายจ่าย${label} ${period}\nรายรับ ${bahtLabel(values.income)} บาท\nรายจ่าย ${bahtLabel(values.expense)} บาท`
   const telegramToken = await maybeDecrypt(row.telegram_bot_token, env.ENCRYPTION_KEY)
   const discordWebhookUrl = await maybeDecrypt(row.discord_webhook_url, env.ENCRYPTION_KEY)
   const tasks: Promise<unknown>[] = []
@@ -763,7 +796,10 @@ export default {
       }
       if (request.method === 'OPTIONS') return cors(new Response(null, { status: 204 }), allowedOrigin)
       try { return cors(await handle(request, env), allowedOrigin) }
-      catch (error) { return cors(fail(error instanceof Error ? error.message : 'เกิดข้อผิดพลาดในระบบ', 500), allowedOrigin) }
+      catch (error) {
+        console.error('Unhandled API error:', error)
+        return cors(fail('เกิดข้อผิดพลาดในระบบ กรุณาลองอีกครั้ง', 500), allowedOrigin)
+      }
     }
 
     if (env.ASSETS) {
