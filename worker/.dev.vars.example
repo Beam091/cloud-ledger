@@ -1,2 +1,3 @@
 JWT_SECRET="local-only-change-me-before-production-2026"
 ENCRYPTION_KEY="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+ENVIRONMENT="development"

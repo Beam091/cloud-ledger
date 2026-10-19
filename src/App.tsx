@@ -37,9 +37,12 @@ function App() {
   const [editingBudget, setEditingBudget] = useState<{ category?: string; amount?: number } | null>(null)
   const [refresh, setRefresh] = useState(0)
   const [query, setQuery] = useState('')
-  const [transactionType, setTransactionType] = useState<'all' | 'income' | 'expense'>('all')
+  const [transactionType, setTransactionType] = useState<'all' | 'income' | 'expense' | 'transfer'>('all')
   const [overviewPeriod, setOverviewPeriod] = useState<PeriodFilter>(() => parseHash(window.location.hash).period || 'month')
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null)
+  const [nextCursor, setNextCursor] = useState<string | null>(null)
+  const [hasMoreTransactions, setHasMoreTransactions] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
 
   const navigate = (next: Page) => {
     window.location.hash = `#/${next}`
@@ -72,11 +75,57 @@ function App() {
   useEffect(() => {
     if (!user) return
     api<Dashboard>(`/api/dashboard?period=${overviewPeriod}`).then(setDashboard).catch((error) => notify(error.message))
-    api<Transaction[] | { results: Transaction[] }>('/api/transactions')
-      .then((result) => setAllTransactions(Array.isArray(result) ? result : result.results))
-      .catch((error) => notify(error instanceof Error ? error.message : 'โหลดรายการไม่สำเร็จ'))
     api<{ results: Recurring[] }>('/api/recurring').then(({ results }) => setRecurringItems(results)).catch(() => undefined)
   }, [user, refresh, overviewPeriod])
+
+  useEffect(() => {
+    if (!user) return
+    const params = new URLSearchParams()
+    if (query.trim()) params.set('q', query.trim())
+    if (transactionType !== 'all') params.set('type', transactionType)
+    params.set('limit', '50')
+
+    api<Transaction[] | { results: Transaction[]; nextCursor?: string | null; hasMore?: boolean }>(`/api/transactions?${params}`)
+      .then((result) => {
+        if (Array.isArray(result)) {
+          setAllTransactions(result)
+          setNextCursor(null)
+          setHasMoreTransactions(false)
+        } else {
+          setAllTransactions(result.results)
+          setNextCursor(result.nextCursor || null)
+          setHasMoreTransactions(Boolean(result.hasMore))
+        }
+      })
+      .catch((error) => notify(error instanceof Error ? error.message : 'โหลดรายการไม่สำเร็จ'))
+  }, [user, refresh, query, transactionType])
+
+  async function loadMoreTransactions() {
+    if (!nextCursor || loadingMore) return
+    setLoadingMore(true)
+    try {
+      const params = new URLSearchParams()
+      if (query.trim()) params.set('q', query.trim())
+      if (transactionType !== 'all') params.set('type', transactionType)
+      params.set('before', nextCursor)
+      params.set('limit', '50')
+
+      const result = await api<Transaction[] | { results: Transaction[]; nextCursor?: string | null; hasMore?: boolean }>(`/api/transactions?${params}`)
+      if (Array.isArray(result)) {
+        setAllTransactions((prev) => [...prev, ...result])
+        setNextCursor(null)
+        setHasMoreTransactions(false)
+      } else {
+        setAllTransactions((prev) => [...prev, ...result.results])
+        setNextCursor(result.nextCursor || null)
+        setHasMoreTransactions(Boolean(result.hasMore))
+      }
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'โหลดรายการเพิ่มไม่สำเร็จ')
+    } finally {
+      setLoadingMore(false)
+    }
+  }
 
   async function logout() {
     try { await api('/api/auth/logout', { method: 'POST' }) } catch { /* network hiccup: clear the view anyway */ }
@@ -222,7 +271,21 @@ function App() {
         </header>
 
         {page === 'overview' && <Overview dashboard={dashboard} period={overviewPeriod} onPeriodChange={(period) => { setOverviewPeriod(period); window.location.hash = `#/overview/${period}` }} onAdd={startTransaction} onNavigate={navigate} onBudgetAdd={startBudget} onBudgetEdit={(budget) => { setEditingBudget({ category: budget.category, amount: budget.limit }); setDialog('budget') }} onBudgetDelete={deleteBudget} />}
-        {page === 'transactions' && <TransactionsPage transactions={allTransactions} query={query} onQuery={setQuery} typeFilter={transactionType} onTypeFilter={setTransactionType} onAdd={startTransaction} onDelete={deleteTransaction} onEdit={(transaction) => { setEditingTransaction(transaction); setDialog('transaction') }} />}
+        {page === 'transactions' && (
+          <TransactionsPage
+            transactions={allTransactions}
+            query={query}
+            onQuery={setQuery}
+            typeFilter={transactionType}
+            onTypeFilter={setTransactionType}
+            hasMore={hasMoreTransactions}
+            loadingMore={loadingMore}
+            onLoadMore={loadMoreTransactions}
+            onAdd={startTransaction}
+            onDelete={deleteTransaction}
+            onEdit={(transaction) => { setEditingTransaction(transaction); setDialog('transaction') }}
+          />
+        )}
         {page === 'accounts' && <AccountsPage accounts={dashboard.accounts} onAdd={() => startAccount()} onEdit={startAccount} onDelete={deleteAccount} />}
         {page === 'recurring' && <RecurringPage items={recurringItems} accounts={dashboard.accounts} onAdd={() => startRecurring()} onEdit={startRecurring} onToggle={toggleRecurring} onDelete={deleteRecurring} />}
         {page === 'settings' && <NotificationSettings notify={notify} />}

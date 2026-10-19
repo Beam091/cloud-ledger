@@ -1,20 +1,35 @@
 import { connect } from 'cloudflare:sockets'
 import { base64url, decoder, encoder, fromBase64 } from './lib/encoding'
-import { toBaht, toSatang } from './lib/money'
+import { sumBalances, toBaht, toSatang } from './lib/money'
 import { dateInTz, tzOffsetMinutes } from './lib/timezone'
-import { cronMatches } from './lib/cron'
+import { cronMatches, isDueInLookbackWindow } from './lib/cron'
 import { tokenFor } from './lib/credentials'
-import { decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, verifyResetCode } from './lib/credentials'
+import { DUMMY_PASSWORD_HASH, decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, verifyResetCode } from './lib/credentials'
+import { RATE_LIMITS, checkRateLimit, getClientIp } from './lib/rateLimit'
 import { accountAliasVariants, normalizeAccountName, scoreAccountMatch } from './lib/accountMatch'
-import { effectsDelta, transactionEffects } from './lib/transactions'
+import {
+  MAX_AMOUNT_BAHT,
+  accountDeletionReversals,
+  effectsDelta,
+  isValidAccountName,
+  isValidAccountType,
+  isValidAmount,
+  isValidCategory,
+  isValidDescription,
+  isValidTransactionDate,
+  transactionEffects,
+  escapeLikeWildcards,
+} from './lib/transactions'
 import { advanceRecurringDate, isValidFrequency, isValidRecurringDate } from './lib/recurring'
+import { detectImageMime, getReceiptResponseHeaders } from './lib/images'
 
-interface Env {
+export interface Env {
   DB: D1Database
   RECEIPTS?: R2Bucket
   JWT_SECRET: string
   ENCRYPTION_KEY: string
   APP_ORIGIN: string
+  ENVIRONMENT?: string
   ASSETS?: Fetcher
 }
 
@@ -23,8 +38,8 @@ interface UploadedFile { type: string; size: number; name: string; stream(): Rea
 interface UserRow extends AuthUser { password_hash: string; is_active: number }
 interface AccountRow { id: string; user_id: string; name: string; type: string; balance: number; currency: string }
 interface TransactionRow { id: string; user_id: string; account_id: string; transfer_account_id: string | null; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string | null; image_url: string | null; image_key: string | null; transaction_date: string }
-interface NotificationRow { user_id: string; gmail_enabled: number; gmail_address: string | null; gmail_app_password_encrypted: string | null; telegram_enabled: number; telegram_bot_token: string | null; telegram_chat_id: string | null; discord_enabled: number; discord_webhook_url: string | null; cron_schedule: string; timezone: string; user_email?: string | null }
-interface RecurringRow { id: string; user_id: string; account_id: string; transfer_account_id: string | null; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string; frequency: 'daily' | 'weekly' | 'monthly'; next_run_date: string; is_active: number }
+interface NotificationRow { user_id: string; gmail_enabled: number; gmail_address: string | null; gmail_app_password_encrypted: string | null; telegram_enabled: number; telegram_bot_token: string | null; telegram_chat_id: string | null; discord_enabled: number; discord_webhook_url: string | null; cron_schedule: string; timezone: string; last_sent_at?: string | null; user_email?: string | null }
+interface RecurringRow { id: string; user_id: string; account_id: string; transfer_account_id: string | null; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string; frequency: 'daily' | 'weekly' | 'monthly'; next_run_date: string; anchor_day?: number | null; is_active: number }
 interface BudgetRow { id: string; user_id: string; category: string; amount: number }
 
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8' } })
@@ -35,24 +50,21 @@ const SESSION_COOKIE = 'ledgerly_session'
 const SESSION_MAX_AGE = 60 * 60 * 24 * 14
 
 // The session JWT lives in an httpOnly cookie so page scripts can never read it.
-// The Bearer header is still accepted as a fallback for sessions created before
-// this change (legacy localStorage tokens) until the next login.
-function sessionCookie(request: Request, token: string | null) {
-  const ownOrigin = new URL(request.url).origin
-  const localDev = [ownOrigin, request.headers.get('origin') || ''].some((origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin))
+function sessionCookie(request: Request, env: Env, token: string | null) {
+  const isDev = env.ENVIRONMENT === 'development'
   const expires = `Max-Age=${token ? SESSION_MAX_AGE : 0}`
-  return `${SESSION_COOKIE}=${token || ''}; Path=/; ${expires}; HttpOnly; Secure; SameSite=${localDev ? 'None' : 'Strict'}`
+  return `${SESSION_COOKIE}=${token || ''}; Path=/; ${expires}; HttpOnly; Secure; SameSite=${isDev ? 'None' : 'Strict'}`
 }
 
 async function sessionResponse(request: Request, env: Env, user: AuthUser, tokenVersion: number, status = 200) {
   const response = json({ user }, status)
-  response.headers.append('set-cookie', sessionCookie(request, await tokenFor(user, env.JWT_SECRET, tokenVersion)))
+  response.headers.append('set-cookie', sessionCookie(request, env, await tokenFor(user, env.JWT_SECRET, tokenVersion)))
   return response
 }
 
 async function authenticate(request: Request, env: Env): Promise<AuthUser | null> {
   const cookieToken = request.headers.get('cookie')?.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]*)`))?.[1]
-  const token = cookieToken || request.headers.get('authorization')?.replace(/^Bearer\s+/i, '') || ''
+  const token = cookieToken || ''
   if (!token) return null
   try {
     const [header, payload, signature] = token.split('.')
@@ -82,7 +94,11 @@ async function budgetSummary(env: Env, userId: string, offsetClause: string, mon
 
 async function settings(env: Env) {
   const result = await env.DB.prepare('SELECT key, value FROM system_settings').all<{ key: string; value: string }>()
-  return Object.fromEntries(result.results.map((row) => [row.key, row.value]))
+  const config = Object.fromEntries(result.results.map((row) => [row.key, row.value]))
+  if (config.ai_api_key) {
+    try { config.ai_api_key = await maybeDecrypt(config.ai_api_key, env.ENCRYPTION_KEY) ?? config.ai_api_key } catch { /* ถ้าถอดรหัสไม่ได้ให้ใช้ค่าเดิม */ }
+  }
+  return config
 }
 
 function normalizedAiBaseUrl(value: string) {
@@ -144,8 +160,9 @@ async function parseWithAI(env: Env, input: string, image?: { mimeType: string; 
 
 async function createTransaction(env: Env, user: AuthUser, data: Omit<TransactionRow, 'id' | 'user_id' | 'image_url' | 'image_key'> & { image_url?: string | null; image_key?: string | null }) {
   const amountSatang = toSatang(data.amount)
-  if (!Number.isInteger(amountSatang) || amountSatang <= 0) throw new Error('จำนวนเงินไม่ถูกต้อง')
+  if (!Number.isInteger(amountSatang) || amountSatang <= 0 || amountSatang > MAX_AMOUNT_BAHT * 100) throw new Error('จำนวนเงินไม่ถูกต้อง')
   if (!['income', 'expense', 'transfer'].includes(data.type)) throw new Error('ประเภทรายการไม่ถูกต้อง')
+  if (!isValidCategory(data.category) || !isValidDescription(data.description)) throw new Error('ข้อมูลรายการไม่ถูกต้อง')
   if (data.type === 'transfer' && (!data.transfer_account_id || data.transfer_account_id === data.account_id)) throw new Error('กรุณาเลือกบัญชีปลายทางที่ต่างจากบัญชีต้นทาง')
   const source = await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(data.account_id, user.id).first()
   if (!source) throw new Error('Account not found')
@@ -181,7 +198,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
   // Public: clearing the session cookie does not require a valid session
   if (path === '/api/auth/logout' && method === 'POST') {
     const response = json({ ok: true })
-    response.headers.append('set-cookie', sessionCookie(request, null))
+    response.headers.append('set-cookie', sessionCookie(request, env, null))
     return response
   }
 
@@ -189,6 +206,18 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const input = await body<{ email: string; password: string }>(request)
     const email = input.email?.trim().toLowerCase()
     if (!email || !/^\S+@\S+\.\S+$/.test(email) || !input.password || input.password.length < 8) return fail('กรุณากรอกอีเมลและรหัสผ่านอย่างน้อย 8 ตัวอักษร')
+
+    const clientIp = getClientIp(request)
+    const regRate = await checkRateLimit(env.DB, `register:${clientIp}`, RATE_LIMITS.REGISTER.limit, RATE_LIMITS.REGISTER.windowSeconds)
+    if (!regRate.allowed) return fail('คุณสมัครสมาชิกบ่อยเกินไป กรุณารอสักครู่', 429)
+
+    const hasUsers = await env.DB.prepare('SELECT 1 FROM users LIMIT 1').first()
+    if (hasUsers) {
+      const regSetting = await env.DB.prepare("SELECT value FROM system_settings WHERE key = 'registration_open'").first<{ value: string }>()
+      const registrationOpen = regSetting ? regSetting.value !== '0' : true
+      if (!registrationOpen) return fail('ระบบปิดรับการลงทะเบียนชั่วคราว', 403)
+    }
+
     if (await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first()) return fail('อีเมลนี้ถูกใช้งานแล้ว', 409)
     const newId = id()
     try {
@@ -208,6 +237,11 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const input = await body<{ email: string }>(request)
     const email = input.email?.trim().toLowerCase()
     if (!email || !/^\S+@\S+\.\S+$/.test(email)) return fail('กรุณากรอกอีเมลให้ถูกต้อง')
+
+    const clientIp = getClientIp(request)
+    const rate = await checkRateLimit(env.DB, `forgot_password:${clientIp}:${email}`, RATE_LIMITS.PASSWORD_RESET.limit, RATE_LIMITS.PASSWORD_RESET.windowSeconds)
+    if (!rate.allowed) return fail('คุณขอรีเซ็ตรหัสผ่านบ่อยเกินไป กรุณารอสักครู่', 429)
+
     const config = await settings(env)
     if (!config.smtp_from_email || !config.smtp_app_password_encrypted) return fail('ระบบยังไม่ได้ตั้งค่าอีเมลส่ง OTP กรุณาติดต่อผู้ดูแลระบบ', 503)
     const generic = { message: 'หากอีเมลนี้มีบัญชีอยู่ ระบบจะส่งรหัส OTP ให้ภายในไม่กี่นาที' }
@@ -232,6 +266,11 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const input = await body<{ email: string; code: string; password: string }>(request)
     const email = input.email?.trim().toLowerCase()
     if (!email || !/^\S+@\S+\.\S+$/.test(email) || !/^\d{6}$/.test(input.code || '') || !input.password || input.password.length < 8) return fail('กรุณาตรวจสอบอีเมล, OTP 6 หลัก และรหัสผ่านอย่างน้อย 8 ตัวอักษร')
+
+    const clientIp = getClientIp(request)
+    const rate = await checkRateLimit(env.DB, `reset_password:${clientIp}:${email}`, RATE_LIMITS.PASSWORD_RESET.limit, RATE_LIMITS.PASSWORD_RESET.windowSeconds)
+    if (!rate.allowed) return fail('คุณดำเนินการบ่อยเกินไป กรุณารอสักครู่', 429)
+
     const user = await env.DB.prepare('SELECT id FROM users WHERE email = ? AND is_active = 1').bind(email).first<{ id: string }>()
     if (!user) return fail('OTP ไม่ถูกต้องหรือหมดอายุ', 400)
     const reset = await env.DB.prepare("SELECT id, code_hash FROM password_reset_otps WHERE user_id = ? AND used_at IS NULL AND attempts < 5 AND expires_at > CURRENT_TIMESTAMP ORDER BY created_at DESC LIMIT 1").bind(user.id).first<{ id: string; code_hash: string }>()
@@ -249,9 +288,16 @@ async function handle(request: Request, env: Env): Promise<Response> {
   }
 
   if (path === '/api/auth/login' && method === 'POST') {
-    const input = await body<{ email: string; password: string }>(request)
-    const row = await env.DB.prepare('SELECT id, email, role, password_hash, is_active, token_version FROM users WHERE email = ?').bind(input.email?.trim().toLowerCase() || '').first<UserRow & { token_version: number }>()
-    if (!row || !(await passwordMatches(input.password || '', row.password_hash))) return fail('อีเมลหรือรหัสผ่านไม่ถูกต้อง', 401)
+    const input = await body<{ email?: string; password?: string }>(request)
+    const email = input.email?.trim().toLowerCase() || ''
+    const clientIp = getClientIp(request)
+    const rate = await checkRateLimit(env.DB, `login:${clientIp}:${email}`, RATE_LIMITS.LOGIN.limit, RATE_LIMITS.LOGIN.windowSeconds)
+    if (!rate.allowed) return fail('คุณพยายามเข้าสู่ระบบบ่อยเกินไป กรุณารอสักครู่', 429)
+
+    const row = await env.DB.prepare('SELECT id, email, role, password_hash, is_active, token_version FROM users WHERE email = ?').bind(email).first<UserRow & { token_version: number }>()
+    const targetHash = row ? row.password_hash : DUMMY_PASSWORD_HASH
+    const matches = await passwordMatches(input.password || '', targetHash)
+    if (!row || !matches) return fail('อีเมลหรือรหัสผ่านไม่ถูกต้อง', 401)
     if (!row.is_active) return fail('บัญชีนี้ถูกปิดใช้งาน กรุณาติดต่อผู้ดูแล', 403)
     return sessionResponse(request, env, { id: row.id, email: row.email, role: row.role }, row.token_version)
   }
@@ -294,7 +340,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       trend: trend.results.map((row) => ({ day: row.day, total: toBaht(row.total) })),
       budgets: budgets.map((row) => ({ category: row.category, limit: toBaht(row.budget_satang), spent: toBaht(row.spent_satang) })),
       period,
-      balance: accounts.results.reduce((sum, account) => sum + toBaht(account.balance), 0),
+      balance: sumBalances(accounts.results),
     })
   }
 
@@ -303,10 +349,10 @@ async function handle(request: Request, env: Env): Promise<Response> {
     return json({ ...rows, results: rows.results.map(toClientAccount) })
   }
   if (path === '/api/accounts' && method === 'POST') {
-    const input = await body<{ name: string; type: string; balance?: number }>(request)
-    if (!input.name?.trim() || !['bank', 'e_wallet', 'cash', 'other'].includes(input.type)) return fail('ข้อมูลบัญชีไม่ถูกต้อง')
+    const input = await body<{ name?: string; type?: string; balance?: number }>(request)
+    if (!isValidAccountName(input.name) || !isValidAccountType(input.type)) return fail('ข้อมูลบัญชีไม่ถูกต้อง')
     const openingBalance = Number(input.balance || 0)
-    if (!Number.isFinite(openingBalance)) return fail('ยอดเงินเริ่มต้นไม่ถูกต้อง')
+    if (!Number.isFinite(openingBalance) || Math.abs(openingBalance) > MAX_AMOUNT_BAHT) return fail('ยอดเงินเริ่มต้นไม่ถูกต้อง')
     const accountId = id()
     await env.DB.prepare('INSERT INTO accounts (id, user_id, name, type, balance) VALUES (?, ?, ?, ?, ?)').bind(accountId, user.id, input.name.trim(), input.type, toSatang(openingBalance)).run()
     const row = await env.DB.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?').bind(accountId, user.id).first<{ balance: number } & Record<string, unknown>>()
@@ -314,32 +360,72 @@ async function handle(request: Request, env: Env): Promise<Response> {
   }
   const accountMatch = path.match(/^\/api\/accounts\/([^/]+)$/)
   if (accountMatch && method === 'PATCH') {
-    const input = await body<{ name: string; type: string }>(request)
+    const input = await body<{ name?: string; type?: string }>(request)
+    if (!isValidAccountName(input.name) || !isValidAccountType(input.type)) return fail('ข้อมูลบัญชีไม่ถูกต้อง')
     const result = await env.DB.prepare('UPDATE accounts SET name = ?, type = ? WHERE id = ? AND user_id = ?').bind(input.name.trim(), input.type, accountMatch[1], user.id).run()
     return result.meta.changes ? json({ ok: true }) : fail('ไม่พบบัญชี', 404)
   }
   if (accountMatch && method === 'DELETE') {
-    const rows = await env.DB.prepare('SELECT image_key FROM transactions WHERE (account_id = ? OR transfer_account_id = ?) AND user_id = ?').bind(accountMatch[1], accountMatch[1], user.id).all<{ image_key: string | null }>()
+    const rows = await env.DB.prepare('SELECT id, type, amount, account_id, transfer_account_id, image_key FROM transactions WHERE (account_id = ? OR transfer_account_id = ?) AND user_id = ?').bind(accountMatch[1], accountMatch[1], user.id).all<{ id: string; type: string; amount: number; account_id: string; transfer_account_id: string | null; image_key: string | null }>()
+    const reversals = accountDeletionReversals(accountMatch[1], rows.results)
     const batch = await env.DB.batch([
+      ...reversals.map((effect) => env.DB.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ? AND user_id = ?').bind(effect.delta, effect.account_id, user.id)),
       env.DB.prepare('DELETE FROM transactions WHERE (account_id = ? OR transfer_account_id = ?) AND user_id = ?').bind(accountMatch[1], accountMatch[1], user.id),
       env.DB.prepare('DELETE FROM accounts WHERE id = ? AND user_id = ?').bind(accountMatch[1], user.id),
     ])
     if (env.RECEIPTS) {
       for (const row of rows.results) if (row.image_key) await env.RECEIPTS.delete(row.image_key)
     }
-    return batch[1]?.meta.changes ? json({ ok: true }) : fail('ไม่พบบัญชี', 404)
+    const accountDeleteResult = batch[batch.length - 1]
+    return accountDeleteResult?.meta.changes ? json({ ok: true }) : fail('ไม่พบบัญชี', 404)
   }
 
   if (path === '/api/transactions' && method === 'GET') {
-    const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 100), 1), 500)
-    const rows = await env.DB.prepare('SELECT t.*, a.name AS account_name, ta.name AS transfer_account_name FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN accounts ta ON ta.id = t.transfer_account_id WHERE t.user_id = ? ORDER BY t.transaction_date DESC LIMIT ?').bind(user.id, limit).all<{ amount: number } & Record<string, unknown>>()
-    return json({ ...rows, results: rows.results.map(toClientTransaction) })
+    const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 50), 1), 500)
+    const q = url.searchParams.get('q')?.trim()
+    const type = url.searchParams.get('type')?.trim()
+    const before = url.searchParams.get('before')?.trim()
+
+    let query = 'SELECT t.*, a.name AS account_name, ta.name AS transfer_account_name FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN accounts ta ON ta.id = t.transfer_account_id WHERE t.user_id = ?'
+    const params: unknown[] = [user.id]
+
+    if (type && ['income', 'expense', 'transfer'].includes(type)) {
+      query += ' AND t.type = ?'
+      params.push(type)
+    }
+
+    if (q) {
+      const escaped = escapeLikeWildcards(q)
+      query += " AND (t.description LIKE ? ESCAPE '\\' OR t.category LIKE ? ESCAPE '\\' OR a.name LIKE ? ESCAPE '\\' OR ta.name LIKE ? ESCAPE '\\')"
+      const likePattern = `%${escaped}%`
+      params.push(likePattern, likePattern, likePattern, likePattern)
+    }
+
+    if (before) {
+      query += ' AND t.transaction_date < ?'
+      params.push(before)
+    }
+
+    query += ' ORDER BY t.transaction_date DESC, t.id DESC LIMIT ?'
+    params.push(limit)
+
+    const rows = await env.DB.prepare(query).bind(...params).all<{ amount: number; transaction_date: string } & Record<string, unknown>>()
+    const clientTransactions = rows.results.map(toClientTransaction)
+    const nextCursor = clientTransactions.length === limit ? clientTransactions[clientTransactions.length - 1].transaction_date : null
+
+    return json({
+      ...rows,
+      results: clientTransactions,
+      nextCursor,
+      hasMore: clientTransactions.length === limit,
+    })
   }
   if (path === '/api/transactions' && method === 'POST') {
     const input = await body<{ account_id: string; transfer_account_id?: string; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description?: string; transaction_date?: string }>(request)
-    if (!(input.amount > 0) || !['income', 'expense', 'transfer'].includes(input.type) || !input.category?.trim()) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    if (!isValidAmount(input.amount) || !['income', 'expense', 'transfer'].includes(input.type) || !isValidCategory(input.category) || !isValidDescription(input.description)) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    if (input.transaction_date !== undefined && !isValidTransactionDate(input.transaction_date)) return fail('วันที่รายการไม่ถูกต้อง')
     try {
-      return json(await createTransaction(env, user, { account_id: input.account_id, transfer_account_id: input.transfer_account_id || null, type: input.type, amount: input.amount, category: input.category, description: input.description || '', transaction_date: input.transaction_date || new Date().toISOString() }), 201)
+      return json(await createTransaction(env, user, { account_id: input.account_id, transfer_account_id: input.transfer_account_id || null, type: input.type, amount: input.amount, category: input.category.trim(), description: input.description || '', transaction_date: input.transaction_date || new Date().toISOString() }), 201)
     } catch (error) {
       console.error('Create transaction failed:', error)
       return fail('ไม่สามารถบันทึกรายการได้ กรุณาตรวจสอบบัญชีที่เลือก', 422)
@@ -350,13 +436,17 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const old = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(transactionMatch[1], user.id).first<TransactionRow>()
     if (!old) return fail('ไม่พบรายการ', 404)
     const input = await body<Partial<TransactionRow>>(request)
+    if (input.transaction_date !== undefined && !isValidTransactionDate(input.transaction_date)) return fail('วันที่รายการไม่ถูกต้อง')
+    if (input.category !== undefined && !isValidCategory(input.category)) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    if (input.description !== undefined && !isValidDescription(input.description)) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    if (input.amount !== undefined && !isValidAmount(input.amount)) return fail('ข้อมูลรายการไม่ถูกต้อง')
     const nextAmount = input.amount === undefined ? Number(old.amount) : toSatang(input.amount)
     const nextType = input.type || old.type
     const nextTransferAccount = nextType === 'transfer'
       ? (input.transfer_account_id === undefined ? old.transfer_account_id : (input.transfer_account_id || null))
       : null
-    const next = { account_id: input.account_id || old.account_id, type: nextType, amount: nextAmount, category: input.category || old.category, description: input.description ?? old.description, transaction_date: input.transaction_date || old.transaction_date, transfer_account_id: nextTransferAccount }
-    if (!(next.amount > 0) || !Number.isInteger(next.amount) || !['income', 'expense', 'transfer'].includes(next.type)) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    const next = { account_id: input.account_id || old.account_id, type: nextType, amount: nextAmount, category: (input.category || old.category).trim(), description: input.description ?? old.description, transaction_date: input.transaction_date || old.transaction_date, transfer_account_id: nextTransferAccount }
+    if (!(next.amount > 0) || !Number.isInteger(next.amount) || next.amount > MAX_AMOUNT_BAHT * 100 || !['income', 'expense', 'transfer'].includes(next.type)) return fail('ข้อมูลรายการไม่ถูกต้อง')
     if (next.type === 'transfer' && (!next.transfer_account_id || next.transfer_account_id === next.account_id)) return fail('กรุณาเลือกบัญชีปลายทางที่ต่างจากบัญชีต้นทาง')
     if (!await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(next.account_id, user.id).first()) return fail('ไม่พบบัญชี', 404)
     if (next.type === 'transfer' && !await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(next.transfer_account_id!, user.id).first()) return fail('ไม่พบบัญชีปลายทาง', 404)
@@ -385,9 +475,8 @@ async function handle(request: Request, env: Env): Promise<Response> {
   }
   if (path === '/api/recurring' && method === 'POST') {
     const input = await body<{ account_id: string; transfer_account_id?: string; type: string; amount: number; category: string; description?: string; frequency: string; start_date?: string }>(request)
-    if (!['income', 'expense', 'transfer'].includes(input.type) || !isValidFrequency(input.frequency)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
+    if (!isValidAmount(input.amount) || !['income', 'expense', 'transfer'].includes(input.type) || !isValidFrequency(input.frequency) || !isValidCategory(input.category) || !isValidDescription(input.description)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
     const amountSatang = toSatang(input.amount)
-    if (!(amountSatang > 0) || !input.category?.trim()) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
     if (!await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(input.account_id, user.id).first()) return fail('ไม่พบบัญชี', 404)
     let destination: string | null = null
     if (input.type === 'transfer') {
@@ -397,10 +486,11 @@ async function handle(request: Request, env: Env): Promise<Response> {
     }
     if (input.start_date !== undefined && !isValidRecurringDate(input.start_date)) return fail('วันที่เริ่มต้นไม่ถูกต้อง')
     const nextRun = input.start_date || dateInTz('Asia/Bangkok')
+    const anchorDay = parseInt(nextRun.slice(8, 10), 10)
     const rowId = id()
-    await env.DB.prepare('INSERT INTO recurring_transactions (id, user_id, account_id, transfer_account_id, type, amount, category, description, frequency, next_run_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .bind(rowId, user.id, input.account_id, destination, input.type, amountSatang, input.category.trim(), input.description || '', input.frequency, nextRun).run()
-    const row = await env.DB.prepare('SELECT id, account_id, transfer_account_id, type, amount, category, description, frequency, next_run_date, is_active FROM recurring_transactions WHERE id = ? AND user_id = ?').bind(rowId, user.id).first<{ amount: number } & Record<string, unknown>>()
+    await env.DB.prepare('INSERT INTO recurring_transactions (id, user_id, account_id, transfer_account_id, type, amount, category, description, frequency, next_run_date, anchor_day) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(rowId, user.id, input.account_id, destination, input.type, amountSatang, input.category.trim(), input.description || '', input.frequency, nextRun, anchorDay).run()
+    const row = await env.DB.prepare('SELECT id, account_id, transfer_account_id, type, amount, category, description, frequency, next_run_date, anchor_day, is_active FROM recurring_transactions WHERE id = ? AND user_id = ?').bind(rowId, user.id).first<{ amount: number } & Record<string, unknown>>()
     return json(row ? toClientTransaction(row) : row, 201)
   }
   const recurringMatch = path.match(/^\/api\/recurring\/([^/]+)$/)
@@ -412,25 +502,31 @@ async function handle(request: Request, env: Env): Promise<Response> {
       return json({ ok: true })
     }
     const input = await body<Partial<RecurringRow>>(request)
+    if (input.amount !== undefined && !isValidAmount(input.amount)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
+    if (input.category !== undefined && !isValidCategory(input.category)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
+    if (input.description !== undefined && !isValidDescription(input.description)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
     const next = {
       account_id: input.account_id || old.account_id,
       type: input.type || old.type,
       amount: input.amount === undefined ? Number(old.amount) : toSatang(input.amount),
-      category: input.category || old.category,
+      category: (input.category || old.category).trim(),
       description: input.description ?? old.description,
       frequency: isValidFrequency(input.frequency) ? input.frequency : old.frequency,
       next_run_date: input.next_run_date === undefined ? old.next_run_date : input.next_run_date,
       is_active: input.is_active === undefined ? old.is_active : (input.is_active ? 1 : 0),
     }
-    if (!(next.amount > 0) || !Number.isFinite(next.amount) || !Number.isInteger(next.amount) || !['income', 'expense', 'transfer'].includes(next.type)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
+    if (!(next.amount > 0) || !Number.isFinite(next.amount) || !Number.isInteger(next.amount) || next.amount > MAX_AMOUNT_BAHT * 100 || !['income', 'expense', 'transfer'].includes(next.type)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
     if (input.next_run_date !== undefined && !isValidRecurringDate(input.next_run_date)) return fail('วันที่เริ่มต้นไม่ถูกต้อง')
     if (next.type === 'transfer' && (!input.transfer_account_id && !old.transfer_account_id)) return fail('กรุณาเลือกบัญชีปลายทาง')
     const destination = next.type === 'transfer' ? (input.transfer_account_id ?? old.transfer_account_id ?? '') : null
     if (next.type === 'transfer' && (!destination || destination === next.account_id)) return fail('กรุณาเลือกบัญชีปลายทางที่ต่างจากบัญชีต้นทาง')
     if (!await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(next.account_id, user.id).first()) return fail('ไม่พบบัญชี', 404)
     if (next.type === 'transfer' && !await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(destination!, user.id).first()) return fail('ไม่พบบัญชีปลายทาง', 404)
-    const updates = await env.DB.prepare('UPDATE recurring_transactions SET account_id = ?, transfer_account_id = ?, type = ?, amount = ?, category = ?, description = ?, frequency = ?, next_run_date = ?, is_active = ? WHERE id = ? AND user_id = ?')
-      .bind(next.account_id, destination, next.type, next.amount, next.category, next.description, next.frequency, next.next_run_date, next.is_active, old.id, user.id).run()
+    const nextAnchor = input.next_run_date !== undefined
+      ? parseInt(input.next_run_date.slice(8, 10), 10)
+      : (old.anchor_day ?? parseInt(old.next_run_date.slice(8, 10), 10))
+    const updates = await env.DB.prepare('UPDATE recurring_transactions SET account_id = ?, transfer_account_id = ?, type = ?, amount = ?, category = ?, description = ?, frequency = ?, next_run_date = ?, anchor_day = ?, is_active = ? WHERE id = ? AND user_id = ?')
+      .bind(next.account_id, destination, next.type, next.amount, next.category, next.description, next.frequency, next.next_run_date, nextAnchor, next.is_active, old.id, user.id).run()
     return updates.meta.changes ? json({ ok: true }) : fail('แก้ไขรายการประจำไม่สำเร็จ')
   }
 
@@ -477,6 +573,11 @@ async function handle(request: Request, env: Env): Promise<Response> {
     return new Response(JSON.stringify(payload, null, 2), { headers: { 'content-type': 'application/json; charset=utf-8', 'content-disposition': `attachment; filename="ledgerly-backup-${stamp}.json"` } })
   }
 
+  if (path.startsWith('/api/ai/')) {
+    const rate = await checkRateLimit(env.DB, `ai:${user.id}`, RATE_LIMITS.AI.limit, RATE_LIMITS.AI.windowSeconds)
+    if (!rate.allowed) return fail('คุณใช้งาน AI เกินโควตาที่กำหนด (30 ครั้ง/ชั่วโมง) กรุณารอสักครู่', 429)
+  }
+
   if (path === '/api/ai/parse' && method === 'POST') {
     const input = await body<{ text: string }>(request)
     if (!input.text?.trim()) return fail('กรุณาพิมพ์รายละเอียดรายการ')
@@ -496,15 +597,18 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const file = upload as unknown as UploadedFile
     if (!file.type.startsWith('image/')) return fail('กรุณาเลือกไฟล์รูปภาพ')
     if (file.size > 8 * 1024 * 1024) return fail('รูปภาพต้องมีขนาดไม่เกิน 8 MB')
+    // ตรวจ magic bytes ก่อนประมวลผล — ปฏิเสธไฟล์ที่ไม่ใช่ JPEG/PNG/WebP/HEIC
+    const fileBytes = new Uint8Array(await file.arrayBuffer())
+    const detectedMime = detectImageMime(fileBytes)
+    if (!detectedMime) return fail('ไม่รองรับประเภทไฟล์รูปภาพนี้ กรุณาใช้ JPEG, PNG, WebP หรือ HEIC', 400)
     try {
       let parsed: Awaited<ReturnType<typeof parseWithAI>> | undefined
       let account: Awaited<ReturnType<typeof findBestAccountForText>>
       if (previewOnly) {
         const accounts = await env.DB.prepare('SELECT name FROM accounts WHERE user_id = ? ORDER BY created_at').bind(user.id).all<{ name: string }>()
-        const bytes = new Uint8Array(await file.arrayBuffer())
         let binary = ''
-        for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
-        parsed = await parseWithAI(env, 'Read the transaction details from this receipt or bank transfer slip. Read every digit carefully and return the amount exactly as shown.', { mimeType: file.type, data: btoa(binary) }, accounts.results.map((item) => item.name))
+        for (let offset = 0; offset < fileBytes.length; offset += 0x8000) binary += String.fromCharCode(...fileBytes.subarray(offset, offset + 0x8000))
+        parsed = await parseWithAI(env, 'Read the transaction details from this receipt or bank transfer slip. Read every digit carefully and return the amount exactly as shown.', { mimeType: detectedMime, data: btoa(binary) }, accounts.results.map((item) => item.name))
         account = await findBestAccountForText(env, user.id, parsed.account_name)
         if (!account) throw new Error('กรุณาเพิ่มบัญชีก่อนบันทึกรายการ')
         return json({ parsed, account_id: account.id, account_name: account.name })
@@ -521,7 +625,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       const config = await settings(env)
       const keepImage = Boolean(env.RECEIPTS && config.image_retention_policy !== 'data_only')
       const key = keepImage ? `${user.id}/${id()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}` : null
-      if (key && env.RECEIPTS) await env.RECEIPTS.put(key, file.stream(), { httpMetadata: { contentType: file.type } })
+      if (key && env.RECEIPTS) await env.RECEIPTS.put(key, fileBytes, { httpMetadata: { contentType: detectedMime }, customMetadata: { contentType: detectedMime } })
       try {
         const transaction = await createTransaction(env, user, { account_id: accountId, transfer_account_id: null, type: type as 'income' | 'expense', amount, category, description, transaction_date: transactionDate ? `${transactionDate}T05:00:00.000Z` : new Date().toISOString(), image_url: key ? `/api/receipts/${encodeURIComponent(key)}` : null, image_key: key })
         return json({ transaction }, 201)
@@ -540,8 +644,9 @@ async function handle(request: Request, env: Env): Promise<Response> {
     if (!await env.DB.prepare('SELECT id FROM transactions WHERE image_key = ? AND user_id = ?').bind(key, user.id).first()) return fail('ไม่พบรูปภาพ', 404)
     const object = await env.RECEIPTS.get(key)
     if (!object) return fail('ไม่พบรูปภาพ', 404)
-    const headers = new Headers({ 'cache-control': 'private, max-age=300' })
-    object.writeHttpMetadata(headers)
+    const storedMime = object.customMetadata?.contentType ?? object.httpMetadata?.contentType
+    const secureHeaders = getReceiptResponseHeaders(storedMime)
+    const headers = new Headers({ 'cache-control': 'private, max-age=300', ...secureHeaders })
     return new Response(object.body, { headers })
   }
 
@@ -570,8 +675,18 @@ async function handle(request: Request, env: Env): Promise<Response> {
     try {
       if (input.telegram_bot_token !== undefined) telegramToken = input.telegram_bot_token?.trim() ? await encrypt(input.telegram_bot_token.trim(), env.ENCRYPTION_KEY) : null
       else telegramToken = previous?.telegram_bot_token ?? null
-      if (input.discord_webhook_url !== undefined) discordWebhook = input.discord_webhook_url?.trim() ? await encrypt(input.discord_webhook_url.trim(), env.ENCRYPTION_KEY) : null
-      else discordWebhook = previous?.discord_webhook_url ?? null
+      if (input.discord_webhook_url !== undefined) {
+        const webhookRaw = input.discord_webhook_url?.trim()
+        if (webhookRaw) {
+          let webhookUrl: URL
+          try { webhookUrl = new URL(webhookRaw) } catch { return fail('Discord Webhook URL ไม่ถูกต้อง') }
+          const validDiscordHosts = ['discord.com', 'discordapp.com']
+          if (webhookUrl.protocol !== 'https:' || !validDiscordHosts.includes(webhookUrl.hostname) || !webhookUrl.pathname.startsWith('/api/webhooks/')) {
+            return fail('Discord Webhook URL ต้องขึ้นต้นด้วย https://discord.com/api/webhooks/ หรือ https://discordapp.com/api/webhooks/')
+          }
+        }
+        discordWebhook = webhookRaw ? await encrypt(webhookRaw, env.ENCRYPTION_KEY) : null
+      } else discordWebhook = previous?.discord_webhook_url ?? null
     } catch (error) {
       console.error('Notification credential encryption failed:', error)
       return fail('ไม่สามารถบันทึกข้อมูลการแจ้งเตือนได้ กรุณาตรวจ ENCRYPTION_KEY ของระบบ', 500)
@@ -634,14 +749,31 @@ async function handle(request: Request, env: Env): Promise<Response> {
     }
     if (path === '/api/admin/settings' && method === 'PUT') {
       const input = await body<Record<string, string>>(request)
-      const allowed = ['ai_provider', 'ai_base_url', 'ai_model', 'ai_api_key', 'image_retention_policy', 'image_retention_days']
+      const allowed = ['ai_provider', 'ai_base_url', 'ai_model', 'ai_api_key', 'image_retention_policy', 'image_retention_days', 'registration_open']
       if (input.image_retention_policy && !['full', 'auto_cleanup', 'data_only'].includes(input.image_retention_policy)) return fail('นโยบายรูปภาพไม่ถูกต้อง')
       let aiBaseUrl: string | undefined
       if (input.ai_base_url !== undefined) {
         try { aiBaseUrl = normalizedAiBaseUrl(input.ai_base_url) }
         catch (error) { return fail(error instanceof Error ? error.message : 'AI base URL ไม่ถูกต้อง') }
       }
-      for (const key of allowed) if (input[key] !== undefined) await env.DB.prepare('INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP').bind(key, key === 'ai_base_url' ? aiBaseUrl : input[key]).run()
+      for (const key of allowed) {
+        if (input[key] !== undefined) {
+          let val: string | undefined
+          if (key === 'ai_base_url') {
+            val = aiBaseUrl
+          } else if (key === 'ai_api_key') {
+            // เข้ารหัส AI API key ก่อนบันทึก — ถอดรหัสด้วย maybeDecrypt ตอนใช้งาน
+            val = input[key].trim() ? await encrypt(input[key].trim(), env.ENCRYPTION_KEY) : undefined
+          } else if (key === 'registration_open') {
+            val = (input[key] === '0' || input[key] === 'false') ? '0' : '1'
+          } else {
+            val = input[key]
+          }
+          if (val !== undefined) {
+            await env.DB.prepare('INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP').bind(key, val).run()
+          }
+        }
+      }
       if (input.smtp_from_email !== undefined) {
         if (input.smtp_from_email && !/^\S+@\S+\.\S+$/.test(input.smtp_from_email)) return fail('อีเมลสำหรับส่ง OTP ไม่ถูกต้อง')
         await env.DB.prepare('INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP').bind('smtp_from_email', input.smtp_from_email.trim().toLowerCase()).run()
@@ -757,9 +889,10 @@ async function materializeRecurring(env: Env) {
     const today = dateInTz(row.timezone || 'Asia/Bangkok')
     let next = row.next_run_date
     let guard = 0
+    const anchor = row.anchor_day ?? parseInt(row.next_run_date.slice(8, 10), 10)
     while (next <= today && guard < 400) {
       guard++
-      const following = advanceRecurringDate(next, row.frequency)
+      const following = advanceRecurringDate(next, row.frequency, anchor)
       try {
         const transactionId = id()
         const statements = [
@@ -783,7 +916,13 @@ async function runScheduled(env: Env) {
   await materializeRecurring(env)
   const users = await env.DB.prepare('SELECT n.*, u.email AS user_email FROM user_notification_settings n JOIN users u ON u.id = n.user_id WHERE u.is_active = 1 AND (n.gmail_enabled = 1 OR n.telegram_enabled = 1 OR n.discord_enabled = 1)').all<NotificationRow>()
   const now = new Date()
-  await Promise.allSettled(users.results.filter((row) => cronMatches(row.cron_schedule, now, row.timezone)).map((row) => dispatchNotification(env, row)))
+  for (const row of users.results) {
+    const check = isDueInLookbackWindow(row.cron_schedule, now, row.timezone, row.last_sent_at)
+    if (check.due && check.slotIso) {
+      await dispatchNotification(env, row)
+      await env.DB.prepare('UPDATE user_notification_settings SET last_sent_at = ? WHERE user_id = ?').bind(check.slotIso, row.user_id).run()
+    }
+  }
   const config = await settings(env)
   if (config.image_retention_policy === 'auto_cleanup' && env.RECEIPTS) {
     const days = Math.max(1, Number(config.image_retention_days || 90))
@@ -798,17 +937,18 @@ export default {
     const url = new URL(request.url)
     if (url.pathname.startsWith('/api/')) {
       const requestOrigin = request.headers.get('origin')
-      // Always allow browser dev servers (localhost) so local development keeps working
-      const localOrigin = Boolean(requestOrigin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(requestOrigin))
-      const allowedOrigin = requestOrigin && (
+      const isDev = env.ENVIRONMENT === 'development'
+      // localhost/127.0.0.1 ได้รับอนุญาตเฉพาะในโหมด development เท่านั้น
+      const localOrigin = isDev && Boolean(requestOrigin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(requestOrigin))
+      // ใน production: หาก APP_ORIGIN ว่างหรือ '*' ให้ fail-closed — ไม่ reflect origin กับ credentials
+      const productionOriginOk = isDev ? true : (Boolean(env.APP_ORIGIN) && env.APP_ORIGIN !== '*')
+      const allowedOrigin = requestOrigin && productionOriginOk && (
         localOrigin ||
-        !env.APP_ORIGIN ||
-        env.APP_ORIGIN === '*' ||
         requestOrigin === env.APP_ORIGIN ||
         requestOrigin === url.origin
-      ) ? requestOrigin : (env.APP_ORIGIN || url.origin)
+      ) ? requestOrigin : url.origin
 
-      if (requestOrigin && !localOrigin && env.APP_ORIGIN && env.APP_ORIGIN !== '*' && requestOrigin !== env.APP_ORIGIN && requestOrigin !== url.origin) {
+      if (requestOrigin && !localOrigin && requestOrigin !== env.APP_ORIGIN && requestOrigin !== url.origin) {
         return fail('Origin not allowed', 403)
       }
       if (request.method === 'OPTIONS') return cors(new Response(null, { status: 204 }), allowedOrigin)

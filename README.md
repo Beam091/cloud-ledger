@@ -28,26 +28,52 @@ npm run dev
 
 ระบบลืมรหัสผ่านมี OTP อายุ 10 นาทีและใช้ได้ครั้งเดียว หากต้องการส่ง OTP หรือสรุป Gmail จริง ให้ admin ตั้ง Gmail sender และ App Password ในหน้า **จัดการระบบ** ก่อน; App Password จะถูกเข้ารหัส AES-256-GCM ก่อนบันทึก ผู้ใช้ระบุเฉพาะอีเมลผู้รับสรุป
 
-## เตรียม Cloudflare
+## เตรียม Cloudflare และการ Deploy
 
-1. เข้าสู่ระบบ Wrangler ด้วย `npx wrangler login`.
-2. สร้าง D1 database ด้วย `npx wrangler d1 create cloud-ledger-db --config worker/wrangler.toml` แล้วแทนค่า `database_id` ใน `worker/wrangler.toml` ด้วย ID ที่ได้.
-3. สร้าง R2 bucket ด้วย `npx wrangler r2 bucket create cloud-ledger-receipts`.
-4. ใช้ `npm run db:remote` เพื่อนำ schema ไปใช้กับ D1 production.
-5. ตั้ง Worker secrets โดยรันคำสั่งต่อไปนี้ทีละคำสั่ง แล้วกรอก secret ที่ terminal ขอ:
-
+1. เข้าสู่ระบบ Wrangler:
+   ```sh
+   npx wrangler login
+   ```
+2. สร้าง D1 database:
+   ```sh
+   npx wrangler d1 create cloud-ledger-db --config worker/wrangler.toml
+   ```
+   แล้วนำ `database_id` ที่ได้รับไปใส่ใน `worker/wrangler.toml`
+3. สร้าง R2 bucket สำหรับเก็บสลิป/ใบเสร็จ:
+   ```sh
+   npx wrangler r2 bucket create cloud-ledger-receipts
+   ```
+4. รัน database migrations ขึ้น Cloudflare D1 production:
+   ```sh
+   npm run db:remote
+   ```
+5. สุ่มสร้างและตั้ง Worker Secrets สำหรับ Production:
+   - **JWT_SECRET**: ข้อความสุ่มยาวอย่างน้อย 32 ตัวอักษร เช่น สุ่มด้วย:
+     ```sh
+     node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+     ```
+   - **ENCRYPTION_KEY**: ต้องเป็น Base64 ของ random 32 bytes เช่น:
+     ```sh
+     node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+     ```
+   นำค่าที่ได้ไปตั้งผ่านคำสั่ง:
    ```sh
    npx wrangler secret put JWT_SECRET --config worker/wrangler.toml
    npx wrangler secret put ENCRYPTION_KEY --config worker/wrangler.toml
    ```
+   *(ห้าม commit หรือใส่ secret ใน vars เด็ดขาด)*
 
-   `JWT_SECRET` ควรเป็นค่าสุ่มยาวอย่างน้อย 32 bytes; `ENCRYPTION_KEY` ต้องเป็น Base64 ของ random 32 bytes สำหรับ AES-256-GCM ห้าม commit secrets หรือใส่ไว้ใน `vars`.
-
-6. แก้ `APP_ORIGIN` ใน `worker/wrangler.toml` เป็น origin ของ Pages production ก่อน deploy API. CORS จะปฏิเสธ origin อื่น.
-7. Deploy API ด้วย `npm run deploy:api`.
-8. กำหนด `VITE_API_URL` เป็น URL ของ Worker ใน Pages build environment แล้ว deploy frontend ด้วย `npm run deploy:pages`.
-
-ค่าเริ่มต้นของ AI คือ Gemini OpenAI-compatible base URL `https://generativelanguage.googleapis.com/v1beta/openai` และ model `gemini-3.5-flash-lite`; admin สามารถเปลี่ยน base URL, โหลดรายการโมเดล และเลือกโมเดลผ่านหน้าเว็บ
+6. กำหนด `APP_ORIGIN` ใน `worker/wrangler.toml` ให้ตรงกับ Domain ของเว็บใน Production (เช่น `https://money.aury.win`) เพื่อให้ CORS และระบบ Strict Cookie ทำงานถูกต้อง
+7. การ Deploy มี 2 ทางเลือก:
+   - **ทางเลือกที่ 1: Deploy แบบ Worker with Assets (แนะนำ)**: รัน `npm run deploy` คำสั่งจะ build frontend และ deploy ควบคู่กับ Worker API ในโดเมนเดียว
+   - **ทางเลือกที่ 2: แยก Pages และ Worker API**:
+     - Deploy Worker: `npm run deploy:api`
+     - Deploy Pages: กำหนด `VITE_API_URL` ใน Pages environment แล้วรัน `npm run deploy:pages`
+8. **การสร้างผู้ดูแลระบบคนแรก (First Admin)**:
+   ผู้ใช้งานคนแรกสุดที่ลงทะเบียนผ่านระบบ (`/api/auth/register`) จะได้รับสิทธิ์เป็น `admin` โดยอัตโนมัติ หลังจากนั้นผู้ดูแลระบบสามารถเปิด/ปิดการรับสมัครสมาชิกใหม่ได้ที่หน้า **จัดการระบบ**
+9. **ข้อกำหนดและการเปิดเผยเกี่ยวกับ AI (AI Disclosure)**:
+   - ฟีเจอร์อ่านข้อความและสลิปใบเสร็จใช้โมเดลภายนอก (ค่าเริ่มต้น Gemini 2.5 Flash Lite ผ่าน OpenAI-compatible endpoint)
+   - ข้อมูลข้อความหรือภาพสลิปจะถูกส่งไปยัง AI provider เพื่อประมวลผลตามที่ผู้ดูแลระบบตั้งค่า โดย API key จะถูกเข้ารหัสอย่างปลอดภัยในระบบและไม่ส่งไปยังเบราว์เซอร์ของผู้ใช้
 
 ## ฟีเจอร์
 

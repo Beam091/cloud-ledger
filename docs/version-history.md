@@ -1,5 +1,22 @@
 # Ledgerly Version History
 
+## v1.0.12
+- วันที่: 2026-10-19
+- ปรับปรุง: เพิ่มความถูกต้องของยอดเงิน ความปลอดภัย การแจ้งเตือน UX และระบบทดสอบอัตโนมัติรอบด้าน
+- รายละเอียด:
+  - แก้ไขการลบบัญชีให้คำนวณเงินคืนข้ามบัญชีจากการโอนอย่างถูกต้อง
+  - รายการประจำรายเดือนรักษาวัน Anchor Day (29–31) ไม่เลื่อนถาวรเมื่อผ่านเดือนสั้น
+  - คำนวณยอดรวม balance ใน dashboard ด้วยหน่วยสตางค์ก่อนแปลงเป็นบาท ป้องกัน floating point คลาดเคลื่อน
+  - ตรวจสอบ input validation เข้มงวด (ชื่อบัญชี, ประเภท, หมวดหมู่, คำอธิบาย, เพดานเงิน 1,000,000,000 บาท และ ISO date)
+  - เพิ่ม Rate limiting สำหรับ login, register, forgot/reset password, AI endpoints พร้อม toggle registration_open และ constant-time password check
+  - ตรวจสอบ magic bytes รูปสลิป ป้องกันการอัปโหลดไฟล์อันตราย พร้อม security headers (CSP sandbox, nosniff)
+  - เข้ารหัส AI API key และตรวจสอบรูปแบบ Discord webhook URL
+  - จำกัด CORS และ SameSite Cookie ใน Production (Strict) และยกเลิก fallback legacy Bearer token
+  - ปรับปรุง Cron summary ด้วย 15-minute lookback window และ deduplication ด้วย `last_sent_at` รองรับ timezone ครึ่งชั่วโมง (+05:30) และ DST
+  - เพิ่ม Server-side search (escape LIKE wildcard), type filter และ cursor pagination พร้อมปุ่มโหลดเพิ่ม
+  - เพิ่ม Worker TypeScript config, CI workflow และ Worker integration tests ด้วย `@cloudflare/vitest-pool-workers`
+- ผลกระทบ: ระบบมีความปลอดภัย เสถียรภาพ และความแม่นยำทางการเงินสูงขึ้นตามมาตรฐาน Production
+
 ## v1.0.11
 - วันที่: 2026-10-18
 - ปรับปรุง: ปรับการจัดวางงบประมาณ/รายการประจำ และแก้การแสดงรายการทั้งหมด

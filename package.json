@@ -1,7 +1,7 @@
 {
   "name": "cloud-ledger",
   "private": true,
-  "version": "1.0.11",
+  "version": "1.0.12",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
@@ -9,7 +9,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "test": "vitest run",
-    "check:worker": "tsc --noEmit --strict --target ES2022 --lib ES2022 --module ESNext --moduleResolution bundler --types @cloudflare/workers-types worker/src/index.ts",
+    "check:worker": "tsc -p worker/tsconfig.json --noEmit",
     "deploy": "npm run build && wrangler deploy --config worker/wrangler.toml",
     "deploy:pages": "npm run build && wrangler pages deploy dist",
     "deploy:api": "wrangler deploy --config worker/wrangler.toml",
@@ -23,6 +23,7 @@
     "recharts": "^2.15.0"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.71",
     "@cloudflare/workers-types": "^4.20250109.0",
     "@tailwindcss/vite": "^4.0.0",
     "@types/react": "^19.0.0",

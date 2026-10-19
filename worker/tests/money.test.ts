@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { signedAmount, toBaht, toSatang } from '../src/lib/money'
+import { signedAmount, sumBalances, toBaht, toSatang } from '../src/lib/money'
 
 describe('toSatang', () => {
   it('converts common baht amounts to exact satang', () => {
@@ -48,5 +48,29 @@ describe('signedAmount', () => {
     expect(signedAmount('income', 1010)).toBe(1010)
     expect(signedAmount('expense', 1010)).toBe(-1010)
     expect(signedAmount('transfer', 1010)).toBe(-1010)
+  })
+})
+
+describe('sumBalances', () => {
+  it('sums satang balances and converts to baht once without floating point drift', () => {
+    // 10.10 + 20.20 in float is 30.300000000000004
+    const accounts = [
+      { balance: 1010 }, // 10.10 THB
+      { balance: 2020 }, // 20.20 THB
+    ]
+    expect(sumBalances(accounts)).toBe(30.3)
+  })
+
+  it('handles empty accounts list', () => {
+    expect(sumBalances([])).toBe(0)
+  })
+
+  it('handles negative and positive balances', () => {
+    const accounts = [
+      { balance: 50000 },  // 500.00 THB
+      { balance: -15025 }, // -150.25 THB
+      { balance: 25 },     // 0.25 THB
+    ]
+    expect(sumBalances(accounts)).toBe(350.0)
   })
 })

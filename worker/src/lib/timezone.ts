@@ -12,9 +12,10 @@ export function dateInTz(timezone: string, date = new Date()) {
 }
 
 // Current offset ("+420" for UTC+7 etc.); defaults to Bangkok when the name is unknown
-export function tzOffsetMinutes(timezone: string) {
+export function tzOffsetMinutes(timezone: string, refDate: Date = new Date()) {
   try {
-    const name = new Intl.DateTimeFormat('en-US', { timeZone: timezone, timeZoneName: 'longOffset' }).formatToParts(new Date()).find((part) => part.type === 'timeZoneName')?.value || ''
+    const name = new Intl.DateTimeFormat('en-US', { timeZone: timezone, timeZoneName: 'longOffset' }).formatToParts(refDate).find((part) => part.type === 'timeZoneName')?.value || ''
+    if (name === 'GMT' || name === 'UTC') return 0
     const match = name.match(/GMT([+-])(\d{2}):(\d{2})/)
     if (!match) return 420
     const sign = match[1] === '-' ? -1 : 1

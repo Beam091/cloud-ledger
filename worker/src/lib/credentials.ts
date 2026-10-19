@@ -10,15 +10,37 @@ export async function tokenFor(user: TokenUser, secret: string, tokenVersion = 0
   return `${header}.${payload}.${base64url(new Uint8Array(signature))}`
 }
 
+export const DUMMY_SALT = new Uint8Array([73, 108, 111, 118, 101, 115, 101, 99, 117, 114, 105, 116, 121, 33, 33, 33])
+export const DUMMY_PASSWORD_HASH = `${base64url(DUMMY_SALT)}.${base64url(new Uint8Array(32))}`
+
+export function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false
+  let diff = 0
+  for (let i = 0; i < a.byteLength; i++) {
+    diff |= a[i] ^ b[i]
+  }
+  return diff === 0
+}
+
 export async function passwordHash(password: string, salt = crypto.getRandomValues(new Uint8Array(16))) {
   const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits'])
   const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 100_000, hash: 'SHA-256' }, key, 256)
   return `${base64url(salt)}.${base64url(new Uint8Array(bits))}`
 }
 
-export async function passwordMatches(password: string, encoded: string) {
-  const [salt, expected] = encoded.split('.')
-  return (await passwordHash(password, fromBase64(salt))).split('.')[1] === expected
+export async function passwordMatches(password: string, encoded: string): Promise<boolean> {
+  const parts = encoded.split('.')
+  if (parts.length !== 2) return false
+  const [saltB64, expectedB64] = parts
+  try {
+    const salt = fromBase64(saltB64)
+    const expected = fromBase64(expectedB64)
+    const key = await crypto.subtle.importKey('raw', encoder.encode(password), 'PBKDF2', false, ['deriveBits'])
+    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 100_000, hash: 'SHA-256' }, key, 256)
+    return timingSafeEqual(new Uint8Array(bits), expected)
+  } catch {
+    return false
+  }
 }
 
 export async function encrypt(value: string, secret: string) {
