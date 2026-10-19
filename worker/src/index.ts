@@ -24,7 +24,7 @@ interface UserRow extends AuthUser { password_hash: string; is_active: number }
 interface AccountRow { id: string; user_id: string; name: string; type: string; balance: number; currency: string }
 interface TransactionRow { id: string; user_id: string; account_id: string; transfer_account_id: string | null; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string | null; image_url: string | null; image_key: string | null; transaction_date: string }
 interface NotificationRow { user_id: string; gmail_enabled: number; gmail_address: string | null; gmail_app_password_encrypted: string | null; telegram_enabled: number; telegram_bot_token: string | null; telegram_chat_id: string | null; discord_enabled: number; discord_webhook_url: string | null; cron_schedule: string; timezone: string; user_email?: string | null }
-interface RecurringRow { id: string; user_id: string; account_id: string; transfer_account_id: string | null; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string; frequency: 'daily' | 'weekly' | 'monthly'; next_run_date: string; is_active: number }
+interface RecurringRow { id: string; user_id: string; account_id: string; transfer_account_id: string | null; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string; frequency: 'daily' | 'weekly' | 'monthly'; next_run_date: string; anchor_day?: number | null; is_active: number }
 interface BudgetRow { id: string; user_id: string; category: string; amount: number }
 
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json; charset=utf-8' } })
@@ -400,10 +400,11 @@ async function handle(request: Request, env: Env): Promise<Response> {
     }
     if (input.start_date !== undefined && !isValidRecurringDate(input.start_date)) return fail('วันที่เริ่มต้นไม่ถูกต้อง')
     const nextRun = input.start_date || dateInTz('Asia/Bangkok')
+    const anchorDay = parseInt(nextRun.slice(8, 10), 10)
     const rowId = id()
-    await env.DB.prepare('INSERT INTO recurring_transactions (id, user_id, account_id, transfer_account_id, type, amount, category, description, frequency, next_run_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .bind(rowId, user.id, input.account_id, destination, input.type, amountSatang, input.category.trim(), input.description || '', input.frequency, nextRun).run()
-    const row = await env.DB.prepare('SELECT id, account_id, transfer_account_id, type, amount, category, description, frequency, next_run_date, is_active FROM recurring_transactions WHERE id = ? AND user_id = ?').bind(rowId, user.id).first<{ amount: number } & Record<string, unknown>>()
+    await env.DB.prepare('INSERT INTO recurring_transactions (id, user_id, account_id, transfer_account_id, type, amount, category, description, frequency, next_run_date, anchor_day) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(rowId, user.id, input.account_id, destination, input.type, amountSatang, input.category.trim(), input.description || '', input.frequency, nextRun, anchorDay).run()
+    const row = await env.DB.prepare('SELECT id, account_id, transfer_account_id, type, amount, category, description, frequency, next_run_date, anchor_day, is_active FROM recurring_transactions WHERE id = ? AND user_id = ?').bind(rowId, user.id).first<{ amount: number } & Record<string, unknown>>()
     return json(row ? toClientTransaction(row) : row, 201)
   }
   const recurringMatch = path.match(/^\/api\/recurring\/([^/]+)$/)
@@ -432,8 +433,11 @@ async function handle(request: Request, env: Env): Promise<Response> {
     if (next.type === 'transfer' && (!destination || destination === next.account_id)) return fail('กรุณาเลือกบัญชีปลายทางที่ต่างจากบัญชีต้นทาง')
     if (!await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(next.account_id, user.id).first()) return fail('ไม่พบบัญชี', 404)
     if (next.type === 'transfer' && !await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(destination!, user.id).first()) return fail('ไม่พบบัญชีปลายทาง', 404)
-    const updates = await env.DB.prepare('UPDATE recurring_transactions SET account_id = ?, transfer_account_id = ?, type = ?, amount = ?, category = ?, description = ?, frequency = ?, next_run_date = ?, is_active = ? WHERE id = ? AND user_id = ?')
-      .bind(next.account_id, destination, next.type, next.amount, next.category, next.description, next.frequency, next.next_run_date, next.is_active, old.id, user.id).run()
+    const nextAnchor = input.next_run_date !== undefined
+      ? parseInt(input.next_run_date.slice(8, 10), 10)
+      : (old.anchor_day ?? parseInt(old.next_run_date.slice(8, 10), 10))
+    const updates = await env.DB.prepare('UPDATE recurring_transactions SET account_id = ?, transfer_account_id = ?, type = ?, amount = ?, category = ?, description = ?, frequency = ?, next_run_date = ?, anchor_day = ?, is_active = ? WHERE id = ? AND user_id = ?')
+      .bind(next.account_id, destination, next.type, next.amount, next.category, next.description, next.frequency, next.next_run_date, nextAnchor, next.is_active, old.id, user.id).run()
     return updates.meta.changes ? json({ ok: true }) : fail('แก้ไขรายการประจำไม่สำเร็จ')
   }
 
@@ -760,9 +764,10 @@ async function materializeRecurring(env: Env) {
     const today = dateInTz(row.timezone || 'Asia/Bangkok')
     let next = row.next_run_date
     let guard = 0
+    const anchor = row.anchor_day ?? parseInt(row.next_run_date.slice(8, 10), 10)
     while (next <= today && guard < 400) {
       guard++
-      const following = advanceRecurringDate(next, row.frequency)
+      const following = advanceRecurringDate(next, row.frequency, anchor)
       try {
         const transactionId = id()
         const statements = [
