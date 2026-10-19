@@ -36,4 +36,17 @@ describe('tzOffsetMinutes', () => {
     expect(tzOffsetMinutes('Not/AZone')).toBe(420)
     expect(tzOffsetMinutes('')).toBe(420)
   })
+
+  it('adjusts for daylight saving time (DST) based on reference date', () => {
+    // America/New_York is UTC-4 in summer (EDT) and UTC-5 in winter (EST)
+    const summerDate = new Date('2026-07-01T12:00:00Z')
+    const winterDate = new Date('2026-01-01T12:00:00Z')
+    expect(tzOffsetMinutes('America/New_York', summerDate)).toBe(-240) // -4 hours = -240 minutes
+    expect(tzOffsetMinutes('America/New_York', winterDate)).toBe(-300) // -5 hours = -300 minutes
+
+    // Europe/London is UTC+1 in summer (BST) and UTC+0 in winter (GMT)
+    expect(tzOffsetMinutes('Europe/London', summerDate)).toBe(60)
+    expect(tzOffsetMinutes('Europe/London', winterDate)).toBe(0)
+  })
 })
+
