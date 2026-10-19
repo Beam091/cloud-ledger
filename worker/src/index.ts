@@ -49,8 +49,6 @@ const SESSION_COOKIE = 'ledgerly_session'
 const SESSION_MAX_AGE = 60 * 60 * 24 * 14
 
 // The session JWT lives in an httpOnly cookie so page scripts can never read it.
-// The Bearer header is still accepted as a fallback for sessions created before
-// this change (legacy localStorage tokens) until the next login.
 function sessionCookie(request: Request, env: Env, token: string | null) {
   const isDev = env.ENVIRONMENT === 'development'
   const expires = `Max-Age=${token ? SESSION_MAX_AGE : 0}`
@@ -65,7 +63,7 @@ async function sessionResponse(request: Request, env: Env, user: AuthUser, token
 
 async function authenticate(request: Request, env: Env): Promise<AuthUser | null> {
   const cookieToken = request.headers.get('cookie')?.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]*)`))?.[1]
-  const token = cookieToken || request.headers.get('authorization')?.replace(/^Bearer\s+/i, '') || ''
+  const token = cookieToken || ''
   if (!token) return null
   try {
     const [header, payload, signature] = token.split('.')
