@@ -20,6 +20,7 @@ import {
   transactionEffects,
 } from './lib/transactions'
 import { advanceRecurringDate, isValidFrequency, isValidRecurringDate } from './lib/recurring'
+import { detectImageMime, getReceiptResponseHeaders } from './lib/images'
 
 interface Env {
   DB: D1Database
@@ -558,15 +559,18 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const file = upload as unknown as UploadedFile
     if (!file.type.startsWith('image/')) return fail('กรุณาเลือกไฟล์รูปภาพ')
     if (file.size > 8 * 1024 * 1024) return fail('รูปภาพต้องมีขนาดไม่เกิน 8 MB')
+    // ตรวจ magic bytes ก่อนประมวลผล — ปฏิเสธไฟล์ที่ไม่ใช่ JPEG/PNG/WebP/HEIC
+    const fileBytes = new Uint8Array(await file.arrayBuffer())
+    const detectedMime = detectImageMime(fileBytes)
+    if (!detectedMime) return fail('ไม่รองรับประเภทไฟล์รูปภาพนี้ กรุณาใช้ JPEG, PNG, WebP หรือ HEIC', 400)
     try {
       let parsed: Awaited<ReturnType<typeof parseWithAI>> | undefined
       let account: Awaited<ReturnType<typeof findBestAccountForText>>
       if (previewOnly) {
         const accounts = await env.DB.prepare('SELECT name FROM accounts WHERE user_id = ? ORDER BY created_at').bind(user.id).all<{ name: string }>()
-        const bytes = new Uint8Array(await file.arrayBuffer())
         let binary = ''
-        for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000))
-        parsed = await parseWithAI(env, 'Read the transaction details from this receipt or bank transfer slip. Read every digit carefully and return the amount exactly as shown.', { mimeType: file.type, data: btoa(binary) }, accounts.results.map((item) => item.name))
+        for (let offset = 0; offset < fileBytes.length; offset += 0x8000) binary += String.fromCharCode(...fileBytes.subarray(offset, offset + 0x8000))
+        parsed = await parseWithAI(env, 'Read the transaction details from this receipt or bank transfer slip. Read every digit carefully and return the amount exactly as shown.', { mimeType: detectedMime, data: btoa(binary) }, accounts.results.map((item) => item.name))
         account = await findBestAccountForText(env, user.id, parsed.account_name)
         if (!account) throw new Error('กรุณาเพิ่มบัญชีก่อนบันทึกรายการ')
         return json({ parsed, account_id: account.id, account_name: account.name })
@@ -583,7 +587,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       const config = await settings(env)
       const keepImage = Boolean(env.RECEIPTS && config.image_retention_policy !== 'data_only')
       const key = keepImage ? `${user.id}/${id()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}` : null
-      if (key && env.RECEIPTS) await env.RECEIPTS.put(key, file.stream(), { httpMetadata: { contentType: file.type } })
+      if (key && env.RECEIPTS) await env.RECEIPTS.put(key, fileBytes, { httpMetadata: { contentType: detectedMime }, customMetadata: { contentType: detectedMime } })
       try {
         const transaction = await createTransaction(env, user, { account_id: accountId, transfer_account_id: null, type: type as 'income' | 'expense', amount, category, description, transaction_date: transactionDate ? `${transactionDate}T05:00:00.000Z` : new Date().toISOString(), image_url: key ? `/api/receipts/${encodeURIComponent(key)}` : null, image_key: key })
         return json({ transaction }, 201)
@@ -602,8 +606,9 @@ async function handle(request: Request, env: Env): Promise<Response> {
     if (!await env.DB.prepare('SELECT id FROM transactions WHERE image_key = ? AND user_id = ?').bind(key, user.id).first()) return fail('ไม่พบรูปภาพ', 404)
     const object = await env.RECEIPTS.get(key)
     if (!object) return fail('ไม่พบรูปภาพ', 404)
-    const headers = new Headers({ 'cache-control': 'private, max-age=300' })
-    object.writeHttpMetadata(headers)
+    const storedMime = object.customMetadata?.contentType ?? object.httpMetadata?.contentType
+    const secureHeaders = getReceiptResponseHeaders(storedMime)
+    const headers = new Headers({ 'cache-control': 'private, max-age=300', ...secureHeaders })
     return new Response(object.body, { headers })
   }
 
