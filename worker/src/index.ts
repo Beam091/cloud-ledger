@@ -28,6 +28,7 @@ interface Env {
   JWT_SECRET: string
   ENCRYPTION_KEY: string
   APP_ORIGIN: string
+  ENVIRONMENT?: string
   ASSETS?: Fetcher
 }
 
@@ -50,16 +51,15 @@ const SESSION_MAX_AGE = 60 * 60 * 24 * 14
 // The session JWT lives in an httpOnly cookie so page scripts can never read it.
 // The Bearer header is still accepted as a fallback for sessions created before
 // this change (legacy localStorage tokens) until the next login.
-function sessionCookie(request: Request, token: string | null) {
-  const ownOrigin = new URL(request.url).origin
-  const localDev = [ownOrigin, request.headers.get('origin') || ''].some((origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin))
+function sessionCookie(request: Request, env: Env, token: string | null) {
+  const isDev = env.ENVIRONMENT === 'development'
   const expires = `Max-Age=${token ? SESSION_MAX_AGE : 0}`
-  return `${SESSION_COOKIE}=${token || ''}; Path=/; ${expires}; HttpOnly; Secure; SameSite=${localDev ? 'None' : 'Strict'}`
+  return `${SESSION_COOKIE}=${token || ''}; Path=/; ${expires}; HttpOnly; Secure; SameSite=${isDev ? 'None' : 'Strict'}`
 }
 
 async function sessionResponse(request: Request, env: Env, user: AuthUser, tokenVersion: number, status = 200) {
   const response = json({ user }, status)
-  response.headers.append('set-cookie', sessionCookie(request, await tokenFor(user, env.JWT_SECRET, tokenVersion)))
+  response.headers.append('set-cookie', sessionCookie(request, env, await tokenFor(user, env.JWT_SECRET, tokenVersion)))
   return response
 }
 
@@ -199,7 +199,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
   // Public: clearing the session cookie does not require a valid session
   if (path === '/api/auth/logout' && method === 'POST') {
     const response = json({ ok: true })
-    response.headers.append('set-cookie', sessionCookie(request, null))
+    response.headers.append('set-cookie', sessionCookie(request, env, null))
     return response
   }
 
@@ -897,17 +897,18 @@ export default {
     const url = new URL(request.url)
     if (url.pathname.startsWith('/api/')) {
       const requestOrigin = request.headers.get('origin')
-      // Always allow browser dev servers (localhost) so local development keeps working
-      const localOrigin = Boolean(requestOrigin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(requestOrigin))
-      const allowedOrigin = requestOrigin && (
+      const isDev = env.ENVIRONMENT === 'development'
+      // localhost/127.0.0.1 ได้รับอนุญาตเฉพาะในโหมด development เท่านั้น
+      const localOrigin = isDev && Boolean(requestOrigin && /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(requestOrigin))
+      // ใน production: หาก APP_ORIGIN ว่างหรือ '*' ให้ fail-closed — ไม่ reflect origin กับ credentials
+      const productionOriginOk = isDev ? true : (Boolean(env.APP_ORIGIN) && env.APP_ORIGIN !== '*')
+      const allowedOrigin = requestOrigin && productionOriginOk && (
         localOrigin ||
-        !env.APP_ORIGIN ||
-        env.APP_ORIGIN === '*' ||
         requestOrigin === env.APP_ORIGIN ||
         requestOrigin === url.origin
-      ) ? requestOrigin : (env.APP_ORIGIN || url.origin)
+      ) ? requestOrigin : url.origin
 
-      if (requestOrigin && !localOrigin && env.APP_ORIGIN && env.APP_ORIGIN !== '*' && requestOrigin !== env.APP_ORIGIN && requestOrigin !== url.origin) {
+      if (requestOrigin && !localOrigin && requestOrigin !== env.APP_ORIGIN && requestOrigin !== url.origin) {
         return fail('Origin not allowed', 403)
       }
       if (request.method === 'OPTIONS') return cors(new Response(null, { status: 204 }), allowedOrigin)
