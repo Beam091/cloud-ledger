@@ -8,6 +8,7 @@
     "dev:api": "wrangler dev --config worker/wrangler.toml --ip 0.0.0.0 --port 8787",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
+    "pretest": "mkdir -p dist",
     "test": "vitest run",
     "check:worker": "tsc -p worker/tsconfig.json --noEmit",
     "deploy": "npm run build && wrangler deploy --config worker/wrangler.toml",
