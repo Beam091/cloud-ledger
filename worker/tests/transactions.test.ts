@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { accountDeletionReversals, effectsDelta, isValidTransactionDate, transactionEffects } from '../src/lib/transactions'
+import {
+  accountDeletionReversals,
+  effectsDelta,
+  isValidAccountName,
+  isValidAccountType,
+  isValidAmount,
+  isValidCategory,
+  isValidDescription,
+  isValidTransactionDate,
+  transactionEffects,
+} from '../src/lib/transactions'
 
 describe('transactionEffects', () => {
   it('income and expense affect a single account', () => {
@@ -154,5 +164,59 @@ describe('isValidTransactionDate', () => {
     expect(isValidTransactionDate(null)).toBe(false)
     expect(isValidTransactionDate(undefined)).toBe(false)
     expect(isValidTransactionDate(123456789)).toBe(false)
+  })
+})
+
+describe('account input validation', () => {
+  it('validates account names', () => {
+    expect(isValidAccountName('Main Bank')).toBe(true)
+    expect(isValidAccountName('a'.repeat(100))).toBe(true)
+    expect(isValidAccountName('a'.repeat(101))).toBe(false)
+    expect(isValidAccountName('')).toBe(false)
+    expect(isValidAccountName('   ')).toBe(false)
+    expect(isValidAccountName(null)).toBe(false)
+  })
+
+  it('validates account types', () => {
+    expect(isValidAccountType('bank')).toBe(true)
+    expect(isValidAccountType('e_wallet')).toBe(true)
+    expect(isValidAccountType('cash')).toBe(true)
+    expect(isValidAccountType('other')).toBe(true)
+    expect(isValidAccountType('crypto')).toBe(false)
+    expect(isValidAccountType('')).toBe(false)
+    expect(isValidAccountType(undefined)).toBe(false)
+  })
+})
+
+describe('transaction and recurring validation limits', () => {
+  it('validates category length and presence', () => {
+    expect(isValidCategory('Food')).toBe(true)
+    expect(isValidCategory('c'.repeat(100))).toBe(true)
+    expect(isValidCategory('c'.repeat(101))).toBe(false)
+    expect(isValidCategory('')).toBe(false)
+    expect(isValidCategory('   ')).toBe(false)
+    expect(isValidCategory(null)).toBe(false)
+  })
+
+  it('validates description length limit', () => {
+    expect(isValidDescription('')).toBe(true)
+    expect(isValidDescription(undefined)).toBe(true)
+    expect(isValidDescription(null)).toBe(true)
+    expect(isValidDescription('Normal description')).toBe(true)
+    expect(isValidDescription('d'.repeat(500))).toBe(true)
+    expect(isValidDescription('d'.repeat(501))).toBe(false)
+    expect(isValidDescription(123)).toBe(false)
+  })
+
+  it('validates amount limits up to ceiling 1,000,000,000 THB', () => {
+    expect(isValidAmount(0.01)).toBe(true)
+    expect(isValidAmount(1000)).toBe(true)
+    expect(isValidAmount(1_000_000_000)).toBe(true)
+    expect(isValidAmount(1_000_000_000.01)).toBe(false)
+    expect(isValidAmount(0)).toBe(false)
+    expect(isValidAmount(-100)).toBe(false)
+    expect(isValidAmount(NaN)).toBe(false)
+    expect(isValidAmount(Infinity)).toBe(false)
+    expect(isValidAmount('100')).toBe(false)
   })
 })

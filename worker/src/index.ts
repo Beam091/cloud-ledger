@@ -6,7 +6,18 @@ import { cronMatches } from './lib/cron'
 import { tokenFor } from './lib/credentials'
 import { decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, verifyResetCode } from './lib/credentials'
 import { accountAliasVariants, normalizeAccountName, scoreAccountMatch } from './lib/accountMatch'
-import { accountDeletionReversals, effectsDelta, isValidTransactionDate, transactionEffects } from './lib/transactions'
+import {
+  MAX_AMOUNT_BAHT,
+  accountDeletionReversals,
+  effectsDelta,
+  isValidAccountName,
+  isValidAccountType,
+  isValidAmount,
+  isValidCategory,
+  isValidDescription,
+  isValidTransactionDate,
+  transactionEffects,
+} from './lib/transactions'
 import { advanceRecurringDate, isValidFrequency, isValidRecurringDate } from './lib/recurring'
 
 interface Env {
@@ -144,8 +155,9 @@ async function parseWithAI(env: Env, input: string, image?: { mimeType: string; 
 
 async function createTransaction(env: Env, user: AuthUser, data: Omit<TransactionRow, 'id' | 'user_id' | 'image_url' | 'image_key'> & { image_url?: string | null; image_key?: string | null }) {
   const amountSatang = toSatang(data.amount)
-  if (!Number.isInteger(amountSatang) || amountSatang <= 0) throw new Error('จำนวนเงินไม่ถูกต้อง')
+  if (!Number.isInteger(amountSatang) || amountSatang <= 0 || amountSatang > MAX_AMOUNT_BAHT * 100) throw new Error('จำนวนเงินไม่ถูกต้อง')
   if (!['income', 'expense', 'transfer'].includes(data.type)) throw new Error('ประเภทรายการไม่ถูกต้อง')
+  if (!isValidCategory(data.category) || !isValidDescription(data.description)) throw new Error('ข้อมูลรายการไม่ถูกต้อง')
   if (data.type === 'transfer' && (!data.transfer_account_id || data.transfer_account_id === data.account_id)) throw new Error('กรุณาเลือกบัญชีปลายทางที่ต่างจากบัญชีต้นทาง')
   const source = await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(data.account_id, user.id).first()
   if (!source) throw new Error('Account not found')
@@ -303,10 +315,10 @@ async function handle(request: Request, env: Env): Promise<Response> {
     return json({ ...rows, results: rows.results.map(toClientAccount) })
   }
   if (path === '/api/accounts' && method === 'POST') {
-    const input = await body<{ name: string; type: string; balance?: number }>(request)
-    if (!input.name?.trim() || !['bank', 'e_wallet', 'cash', 'other'].includes(input.type)) return fail('ข้อมูลบัญชีไม่ถูกต้อง')
+    const input = await body<{ name?: string; type?: string; balance?: number }>(request)
+    if (!isValidAccountName(input.name) || !isValidAccountType(input.type)) return fail('ข้อมูลบัญชีไม่ถูกต้อง')
     const openingBalance = Number(input.balance || 0)
-    if (!Number.isFinite(openingBalance)) return fail('ยอดเงินเริ่มต้นไม่ถูกต้อง')
+    if (!Number.isFinite(openingBalance) || Math.abs(openingBalance) > MAX_AMOUNT_BAHT) return fail('ยอดเงินเริ่มต้นไม่ถูกต้อง')
     const accountId = id()
     await env.DB.prepare('INSERT INTO accounts (id, user_id, name, type, balance) VALUES (?, ?, ?, ?, ?)').bind(accountId, user.id, input.name.trim(), input.type, toSatang(openingBalance)).run()
     const row = await env.DB.prepare('SELECT * FROM accounts WHERE id = ? AND user_id = ?').bind(accountId, user.id).first<{ balance: number } & Record<string, unknown>>()
@@ -314,7 +326,8 @@ async function handle(request: Request, env: Env): Promise<Response> {
   }
   const accountMatch = path.match(/^\/api\/accounts\/([^/]+)$/)
   if (accountMatch && method === 'PATCH') {
-    const input = await body<{ name: string; type: string }>(request)
+    const input = await body<{ name?: string; type?: string }>(request)
+    if (!isValidAccountName(input.name) || !isValidAccountType(input.type)) return fail('ข้อมูลบัญชีไม่ถูกต้อง')
     const result = await env.DB.prepare('UPDATE accounts SET name = ?, type = ? WHERE id = ? AND user_id = ?').bind(input.name.trim(), input.type, accountMatch[1], user.id).run()
     return result.meta.changes ? json({ ok: true }) : fail('ไม่พบบัญชี', 404)
   }
@@ -340,10 +353,10 @@ async function handle(request: Request, env: Env): Promise<Response> {
   }
   if (path === '/api/transactions' && method === 'POST') {
     const input = await body<{ account_id: string; transfer_account_id?: string; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description?: string; transaction_date?: string }>(request)
-    if (!(input.amount > 0) || !['income', 'expense', 'transfer'].includes(input.type) || !input.category?.trim()) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    if (!isValidAmount(input.amount) || !['income', 'expense', 'transfer'].includes(input.type) || !isValidCategory(input.category) || !isValidDescription(input.description)) return fail('ข้อมูลรายการไม่ถูกต้อง')
     if (input.transaction_date !== undefined && !isValidTransactionDate(input.transaction_date)) return fail('วันที่รายการไม่ถูกต้อง')
     try {
-      return json(await createTransaction(env, user, { account_id: input.account_id, transfer_account_id: input.transfer_account_id || null, type: input.type, amount: input.amount, category: input.category, description: input.description || '', transaction_date: input.transaction_date || new Date().toISOString() }), 201)
+      return json(await createTransaction(env, user, { account_id: input.account_id, transfer_account_id: input.transfer_account_id || null, type: input.type, amount: input.amount, category: input.category.trim(), description: input.description || '', transaction_date: input.transaction_date || new Date().toISOString() }), 201)
     } catch (error) {
       console.error('Create transaction failed:', error)
       return fail('ไม่สามารถบันทึกรายการได้ กรุณาตรวจสอบบัญชีที่เลือก', 422)
@@ -355,13 +368,16 @@ async function handle(request: Request, env: Env): Promise<Response> {
     if (!old) return fail('ไม่พบรายการ', 404)
     const input = await body<Partial<TransactionRow>>(request)
     if (input.transaction_date !== undefined && !isValidTransactionDate(input.transaction_date)) return fail('วันที่รายการไม่ถูกต้อง')
+    if (input.category !== undefined && !isValidCategory(input.category)) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    if (input.description !== undefined && !isValidDescription(input.description)) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    if (input.amount !== undefined && !isValidAmount(input.amount)) return fail('ข้อมูลรายการไม่ถูกต้อง')
     const nextAmount = input.amount === undefined ? Number(old.amount) : toSatang(input.amount)
     const nextType = input.type || old.type
     const nextTransferAccount = nextType === 'transfer'
       ? (input.transfer_account_id === undefined ? old.transfer_account_id : (input.transfer_account_id || null))
       : null
-    const next = { account_id: input.account_id || old.account_id, type: nextType, amount: nextAmount, category: input.category || old.category, description: input.description ?? old.description, transaction_date: input.transaction_date || old.transaction_date, transfer_account_id: nextTransferAccount }
-    if (!(next.amount > 0) || !Number.isInteger(next.amount) || !['income', 'expense', 'transfer'].includes(next.type)) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    const next = { account_id: input.account_id || old.account_id, type: nextType, amount: nextAmount, category: (input.category || old.category).trim(), description: input.description ?? old.description, transaction_date: input.transaction_date || old.transaction_date, transfer_account_id: nextTransferAccount }
+    if (!(next.amount > 0) || !Number.isInteger(next.amount) || next.amount > MAX_AMOUNT_BAHT * 100 || !['income', 'expense', 'transfer'].includes(next.type)) return fail('ข้อมูลรายการไม่ถูกต้อง')
     if (next.type === 'transfer' && (!next.transfer_account_id || next.transfer_account_id === next.account_id)) return fail('กรุณาเลือกบัญชีปลายทางที่ต่างจากบัญชีต้นทาง')
     if (!await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(next.account_id, user.id).first()) return fail('ไม่พบบัญชี', 404)
     if (next.type === 'transfer' && !await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(next.transfer_account_id!, user.id).first()) return fail('ไม่พบบัญชีปลายทาง', 404)
@@ -390,9 +406,8 @@ async function handle(request: Request, env: Env): Promise<Response> {
   }
   if (path === '/api/recurring' && method === 'POST') {
     const input = await body<{ account_id: string; transfer_account_id?: string; type: string; amount: number; category: string; description?: string; frequency: string; start_date?: string }>(request)
-    if (!['income', 'expense', 'transfer'].includes(input.type) || !isValidFrequency(input.frequency)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
+    if (!isValidAmount(input.amount) || !['income', 'expense', 'transfer'].includes(input.type) || !isValidFrequency(input.frequency) || !isValidCategory(input.category) || !isValidDescription(input.description)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
     const amountSatang = toSatang(input.amount)
-    if (!(amountSatang > 0) || !input.category?.trim()) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
     if (!await env.DB.prepare('SELECT id FROM accounts WHERE id = ? AND user_id = ?').bind(input.account_id, user.id).first()) return fail('ไม่พบบัญชี', 404)
     let destination: string | null = null
     if (input.type === 'transfer') {
@@ -418,17 +433,20 @@ async function handle(request: Request, env: Env): Promise<Response> {
       return json({ ok: true })
     }
     const input = await body<Partial<RecurringRow>>(request)
+    if (input.amount !== undefined && !isValidAmount(input.amount)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
+    if (input.category !== undefined && !isValidCategory(input.category)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
+    if (input.description !== undefined && !isValidDescription(input.description)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
     const next = {
       account_id: input.account_id || old.account_id,
       type: input.type || old.type,
       amount: input.amount === undefined ? Number(old.amount) : toSatang(input.amount),
-      category: input.category || old.category,
+      category: (input.category || old.category).trim(),
       description: input.description ?? old.description,
       frequency: isValidFrequency(input.frequency) ? input.frequency : old.frequency,
       next_run_date: input.next_run_date === undefined ? old.next_run_date : input.next_run_date,
       is_active: input.is_active === undefined ? old.is_active : (input.is_active ? 1 : 0),
     }
-    if (!(next.amount > 0) || !Number.isFinite(next.amount) || !Number.isInteger(next.amount) || !['income', 'expense', 'transfer'].includes(next.type)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
+    if (!(next.amount > 0) || !Number.isFinite(next.amount) || !Number.isInteger(next.amount) || next.amount > MAX_AMOUNT_BAHT * 100 || !['income', 'expense', 'transfer'].includes(next.type)) return fail('ข้อมูลรายการประจำไม่ถูกต้อง')
     if (input.next_run_date !== undefined && !isValidRecurringDate(input.next_run_date)) return fail('วันที่เริ่มต้นไม่ถูกต้อง')
     if (next.type === 'transfer' && (!input.transfer_account_id && !old.transfer_account_id)) return fail('กรุณาเลือกบัญชีปลายทาง')
     const destination = next.type === 'transfer' ? (input.transfer_account_id ?? old.transfer_account_id ?? '') : null
