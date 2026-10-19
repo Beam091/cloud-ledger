@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { DUMMY_PASSWORD_HASH, decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, timingSafeEqual, tokenFor, verifyResetCode } from '../src/lib/credentials'
 
@@ -75,11 +74,11 @@ describe('token', () => {
 
 describe('reset code digest', () => {
   it('is verifiable only for the same user + code', async () => {
-    const userId = randomUUID()
+    const userId = crypto.randomUUID()
     const digest = await resetCodeDigest(userId, '123456', SECRET)
     expect(await verifyResetCode(userId, '123456', digest, SECRET)).toBe(true)
     expect(await verifyResetCode(userId, '654321', digest, SECRET)).toBe(false)
-    expect(await verifyResetCode(randomUUID(), '123456', digest, SECRET)).toBe(false)
+    expect(await verifyResetCode(crypto.randomUUID(), '123456', digest, SECRET)).toBe(false)
   })
 })
 

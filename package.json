@@ -9,7 +9,7 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "test": "vitest run",
-    "check:worker": "tsc --noEmit --strict --target ES2022 --lib ES2022 --module ESNext --moduleResolution bundler --types @cloudflare/workers-types worker/src/index.ts",
+    "check:worker": "tsc -p worker/tsconfig.json --noEmit",
     "deploy": "npm run build && wrangler deploy --config worker/wrangler.toml",
     "deploy:pages": "npm run build && wrangler pages deploy dist",
     "deploy:api": "wrangler deploy --config worker/wrangler.toml",

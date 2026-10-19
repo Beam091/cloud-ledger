@@ -25,6 +25,9 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Typecheck worker
+        run: npm run check:worker
+
       - name: Build frontend
         run: npm run build
 
