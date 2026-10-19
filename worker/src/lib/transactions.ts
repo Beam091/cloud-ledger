@@ -103,3 +103,8 @@ export function accountDeletionReversals(accountIdToDelete: string, transactions
     .filter(([, delta]) => delta !== 0)
     .map(([account_id, delta]) => ({ account_id, delta }))
 }
+
+export function escapeLikeWildcards(str: string): string {
+  return str.replace(/([%_\\])/g, '\\$1')
+}
+

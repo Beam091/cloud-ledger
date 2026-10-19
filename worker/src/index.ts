@@ -18,6 +18,7 @@ import {
   isValidDescription,
   isValidTransactionDate,
   transactionEffects,
+  escapeLikeWildcards,
 } from './lib/transactions'
 import { advanceRecurringDate, isValidFrequency, isValidRecurringDate } from './lib/recurring'
 import { detectImageMime, getReceiptResponseHeaders } from './lib/images'
@@ -380,9 +381,44 @@ async function handle(request: Request, env: Env): Promise<Response> {
   }
 
   if (path === '/api/transactions' && method === 'GET') {
-    const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 100), 1), 500)
-    const rows = await env.DB.prepare('SELECT t.*, a.name AS account_name, ta.name AS transfer_account_name FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN accounts ta ON ta.id = t.transfer_account_id WHERE t.user_id = ? ORDER BY t.transaction_date DESC LIMIT ?').bind(user.id, limit).all<{ amount: number } & Record<string, unknown>>()
-    return json({ ...rows, results: rows.results.map(toClientTransaction) })
+    const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 50), 1), 500)
+    const q = url.searchParams.get('q')?.trim()
+    const type = url.searchParams.get('type')?.trim()
+    const before = url.searchParams.get('before')?.trim()
+
+    let query = 'SELECT t.*, a.name AS account_name, ta.name AS transfer_account_name FROM transactions t JOIN accounts a ON a.id = t.account_id LEFT JOIN accounts ta ON ta.id = t.transfer_account_id WHERE t.user_id = ?'
+    const params: unknown[] = [user.id]
+
+    if (type && ['income', 'expense', 'transfer'].includes(type)) {
+      query += ' AND t.type = ?'
+      params.push(type)
+    }
+
+    if (q) {
+      const escaped = escapeLikeWildcards(q)
+      query += " AND (t.description LIKE ? ESCAPE '\\' OR t.category LIKE ? ESCAPE '\\' OR a.name LIKE ? ESCAPE '\\' OR ta.name LIKE ? ESCAPE '\\')"
+      const likePattern = `%${escaped}%`
+      params.push(likePattern, likePattern, likePattern, likePattern)
+    }
+
+    if (before) {
+      query += ' AND t.transaction_date < ?'
+      params.push(before)
+    }
+
+    query += ' ORDER BY t.transaction_date DESC, t.id DESC LIMIT ?'
+    params.push(limit)
+
+    const rows = await env.DB.prepare(query).bind(...params).all<{ amount: number; transaction_date: string } & Record<string, unknown>>()
+    const clientTransactions = rows.results.map(toClientTransaction)
+    const nextCursor = clientTransactions.length === limit ? clientTransactions[clientTransactions.length - 1].transaction_date : null
+
+    return json({
+      ...rows,
+      results: clientTransactions,
+      nextCursor,
+      hasMore: clientTransactions.length === limit,
+    })
   }
   if (path === '/api/transactions' && method === 'POST') {
     const input = await body<{ account_id: string; transfer_account_id?: string; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description?: string; transaction_date?: string }>(request)

@@ -9,6 +9,7 @@ import {
   isValidDescription,
   isValidTransactionDate,
   transactionEffects,
+  escapeLikeWildcards,
 } from '../src/lib/transactions'
 
 describe('transactionEffects', () => {
@@ -220,3 +221,14 @@ describe('transaction and recurring validation limits', () => {
     expect(isValidAmount('100')).toBe(false)
   })
 })
+
+describe('escapeLikeWildcards', () => {
+  it('escapes %, _, and \\ characters for SQL LIKE query', () => {
+    expect(escapeLikeWildcards('50%')).toBe('50\\%')
+    expect(escapeLikeWildcards('user_name')).toBe('user\\_name')
+    expect(escapeLikeWildcards('c:\\path')).toBe('c:\\\\path')
+    expect(escapeLikeWildcards('100%_sale\\test')).toBe('100\\%\\_sale\\\\test')
+    expect(escapeLikeWildcards('normal string')).toBe('normal string')
+  })
+})
+
