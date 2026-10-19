@@ -23,7 +23,7 @@ import {
 import { advanceRecurringDate, isValidFrequency, isValidRecurringDate } from './lib/recurring'
 import { detectImageMime, getReceiptResponseHeaders } from './lib/images'
 
-interface Env {
+export interface Env {
   DB: D1Database
   RECEIPTS?: R2Bucket
   JWT_SECRET: string

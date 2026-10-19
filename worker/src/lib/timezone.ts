@@ -15,6 +15,7 @@ export function dateInTz(timezone: string, date = new Date()) {
 export function tzOffsetMinutes(timezone: string, refDate: Date = new Date()) {
   try {
     const name = new Intl.DateTimeFormat('en-US', { timeZone: timezone, timeZoneName: 'longOffset' }).formatToParts(refDate).find((part) => part.type === 'timeZoneName')?.value || ''
+    if (name === 'GMT' || name === 'UTC') return 0
     const match = name.match(/GMT([+-])(\d{2}):(\d{2})/)
     if (!match) return 420
     const sign = match[1] === '-' ? -1 : 1
