@@ -15,6 +15,12 @@ export default defineWorkersConfig(async () => {
           singleWorker: true,
           wrangler: { configPath: './worker/wrangler.toml' },
           miniflare: {
+            // Override assets directory: wrangler.toml points to ../dist which
+            // doesn't exist before a frontend build. Use a committed stub so CI
+            // tests pass without requiring a prior build step.
+            workerOptions: {
+              assetsDirectory: path.join(__dirname, 'worker/tests/assets'),
+            },
             bindings: {
               JWT_SECRET: 'test-jwt-secret-key-12345678901234567890',
               ENCRYPTION_KEY: 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=',
