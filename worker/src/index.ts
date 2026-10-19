@@ -641,8 +641,18 @@ async function handle(request: Request, env: Env): Promise<Response> {
     try {
       if (input.telegram_bot_token !== undefined) telegramToken = input.telegram_bot_token?.trim() ? await encrypt(input.telegram_bot_token.trim(), env.ENCRYPTION_KEY) : null
       else telegramToken = previous?.telegram_bot_token ?? null
-      if (input.discord_webhook_url !== undefined) discordWebhook = input.discord_webhook_url?.trim() ? await encrypt(input.discord_webhook_url.trim(), env.ENCRYPTION_KEY) : null
-      else discordWebhook = previous?.discord_webhook_url ?? null
+      if (input.discord_webhook_url !== undefined) {
+        const webhookRaw = input.discord_webhook_url?.trim()
+        if (webhookRaw) {
+          let webhookUrl: URL
+          try { webhookUrl = new URL(webhookRaw) } catch { return fail('Discord Webhook URL ไม่ถูกต้อง') }
+          const validDiscordHosts = ['discord.com', 'discordapp.com']
+          if (webhookUrl.protocol !== 'https:' || !validDiscordHosts.includes(webhookUrl.hostname) || !webhookUrl.pathname.startsWith('/api/webhooks/')) {
+            return fail('Discord Webhook URL ต้องขึ้นต้นด้วย https://discord.com/api/webhooks/ หรือ https://discordapp.com/api/webhooks/')
+          }
+        }
+        discordWebhook = webhookRaw ? await encrypt(webhookRaw, env.ENCRYPTION_KEY) : null
+      } else discordWebhook = previous?.discord_webhook_url ?? null
     } catch (error) {
       console.error('Notification credential encryption failed:', error)
       return fail('ไม่สามารถบันทึกข้อมูลการแจ้งเตือนได้ กรุณาตรวจ ENCRYPTION_KEY ของระบบ', 500)
