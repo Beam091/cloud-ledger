@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { accountDeletionReversals, effectsDelta, transactionEffects } from '../src/lib/transactions'
+import { accountDeletionReversals, effectsDelta, isValidTransactionDate, transactionEffects } from '../src/lib/transactions'
 
 describe('transactionEffects', () => {
   it('income and expense affect a single account', () => {
@@ -126,5 +126,33 @@ describe('accountDeletionReversals', () => {
       { account_id: 'B', delta: -6000 },
       { account_id: 'C', delta: -20000 },
     ])
+  })
+})
+
+describe('isValidTransactionDate', () => {
+  it('accepts valid ISO 8601 strings parseable by SQLite date()', () => {
+    expect(isValidTransactionDate('2026-10-19')).toBe(true)
+    expect(isValidTransactionDate('2026-10-19T10:00:00Z')).toBe(true)
+    expect(isValidTransactionDate('2026-10-19T10:00:00.000Z')).toBe(true)
+    expect(isValidTransactionDate('2026-10-19 10:00:00')).toBe(true)
+    expect(isValidTransactionDate('2026-10-19T10:00:00+07:00')).toBe(true)
+    expect(isValidTransactionDate('2026-10-19T10:00:00-05:00')).toBe(true)
+    expect(isValidTransactionDate('2026-10-19T10:00')).toBe(true)
+    expect(isValidTransactionDate('2024-02-29')).toBe(true) // Leap year
+  })
+
+  it('rejects invalid or non-ISO dates where SQLite date() returns NULL or JS Date is NaN', () => {
+    expect(isValidTransactionDate('invalid')).toBe(false)
+    expect(isValidTransactionDate('')).toBe(false)
+    expect(isValidTransactionDate('2026/10/19')).toBe(false) // Slash not allowed in SQLite date()
+    expect(isValidTransactionDate('10-19-2026')).toBe(false)
+    expect(isValidTransactionDate('2026-10-19T10:00:00+0700')).toBe(false) // Missing colon in TZ offset
+    expect(isValidTransactionDate('2026-10-19T')).toBe(false)
+    expect(isValidTransactionDate('2026-10-19T25:00:00')).toBe(false)
+    expect(isValidTransactionDate('2026-02-30')).toBe(false)
+    expect(isValidTransactionDate('2026-02-29')).toBe(false) // Non-leap year
+    expect(isValidTransactionDate(null)).toBe(false)
+    expect(isValidTransactionDate(undefined)).toBe(false)
+    expect(isValidTransactionDate(123456789)).toBe(false)
   })
 })

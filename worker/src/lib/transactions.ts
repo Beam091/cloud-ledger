@@ -34,6 +34,24 @@ export function effectsDelta(before: BalanceEffect[], after: BalanceEffect[]): B
     .map(([account_id, delta]) => ({ account_id, delta }))
 }
 
+// Validates ISO 8601 transaction date strings that are parseable by both JS Date and SQLite date()
+const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?$/
+
+export function isValidTransactionDate(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  if (!ISO_DATE_REGEX.test(value)) return false
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return false
+  const parts = value.slice(0, 10).split('-')
+  const year = parseInt(parts[0], 10)
+  const month = parseInt(parts[1], 10)
+  const day = parseInt(parts[2], 10)
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate()
+  if (day > daysInMonth) return false
+  return true
+}
+
 // When an account is deleted, all its transactions are also removed.
 // Any transaction that touched another account (such as a cross-account transfer)
 // must have its effect reverted on that other account.

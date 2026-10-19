@@ -6,7 +6,7 @@ import { cronMatches } from './lib/cron'
 import { tokenFor } from './lib/credentials'
 import { decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, verifyResetCode } from './lib/credentials'
 import { accountAliasVariants, normalizeAccountName, scoreAccountMatch } from './lib/accountMatch'
-import { accountDeletionReversals, effectsDelta, transactionEffects } from './lib/transactions'
+import { accountDeletionReversals, effectsDelta, isValidTransactionDate, transactionEffects } from './lib/transactions'
 import { advanceRecurringDate, isValidFrequency, isValidRecurringDate } from './lib/recurring'
 
 interface Env {
@@ -341,6 +341,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
   if (path === '/api/transactions' && method === 'POST') {
     const input = await body<{ account_id: string; transfer_account_id?: string; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description?: string; transaction_date?: string }>(request)
     if (!(input.amount > 0) || !['income', 'expense', 'transfer'].includes(input.type) || !input.category?.trim()) return fail('ข้อมูลรายการไม่ถูกต้อง')
+    if (input.transaction_date !== undefined && !isValidTransactionDate(input.transaction_date)) return fail('วันที่รายการไม่ถูกต้อง')
     try {
       return json(await createTransaction(env, user, { account_id: input.account_id, transfer_account_id: input.transfer_account_id || null, type: input.type, amount: input.amount, category: input.category, description: input.description || '', transaction_date: input.transaction_date || new Date().toISOString() }), 201)
     } catch (error) {
@@ -353,6 +354,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const old = await env.DB.prepare('SELECT * FROM transactions WHERE id = ? AND user_id = ?').bind(transactionMatch[1], user.id).first<TransactionRow>()
     if (!old) return fail('ไม่พบรายการ', 404)
     const input = await body<Partial<TransactionRow>>(request)
+    if (input.transaction_date !== undefined && !isValidTransactionDate(input.transaction_date)) return fail('วันที่รายการไม่ถูกต้อง')
     const nextAmount = input.amount === undefined ? Number(old.amount) : toSatang(input.amount)
     const nextType = input.type || old.type
     const nextTransferAccount = nextType === 'transfer'
