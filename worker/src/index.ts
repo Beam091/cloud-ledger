@@ -95,7 +95,11 @@ async function budgetSummary(env: Env, userId: string, offsetClause: string, mon
 
 async function settings(env: Env) {
   const result = await env.DB.prepare('SELECT key, value FROM system_settings').all<{ key: string; value: string }>()
-  return Object.fromEntries(result.results.map((row) => [row.key, row.value]))
+  const config = Object.fromEntries(result.results.map((row) => [row.key, row.value]))
+  if (config.ai_api_key) {
+    try { config.ai_api_key = await maybeDecrypt(config.ai_api_key, env.ENCRYPTION_KEY) ?? config.ai_api_key } catch { /* ถ้าถอดรหัสไม่ได้ให้ใช้ค่าเดิม */ }
+  }
+  return config
 }
 
 function normalizedAiBaseUrl(value: string) {
@@ -710,8 +714,20 @@ async function handle(request: Request, env: Env): Promise<Response> {
       }
       for (const key of allowed) {
         if (input[key] !== undefined) {
-          const val = key === 'ai_base_url' ? aiBaseUrl : (key === 'registration_open' ? (input[key] === '0' || input[key] === 'false' ? '0' : '1') : input[key])
-          await env.DB.prepare('INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP').bind(key, val).run()
+          let val: string | undefined
+          if (key === 'ai_base_url') {
+            val = aiBaseUrl
+          } else if (key === 'ai_api_key') {
+            // เข้ารหัส AI API key ก่อนบันทึก — ถอดรหัสด้วย maybeDecrypt ตอนใช้งาน
+            val = input[key].trim() ? await encrypt(input[key].trim(), env.ENCRYPTION_KEY) : undefined
+          } else if (key === 'registration_open') {
+            val = (input[key] === '0' || input[key] === 'false') ? '0' : '1'
+          } else {
+            val = input[key]
+          }
+          if (val !== undefined) {
+            await env.DB.prepare('INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP').bind(key, val).run()
+          }
         }
       }
       if (input.smtp_from_email !== undefined) {
