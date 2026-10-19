@@ -6,7 +6,7 @@ import { cronMatches } from './lib/cron'
 import { tokenFor } from './lib/credentials'
 import { decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, verifyResetCode } from './lib/credentials'
 import { accountAliasVariants, normalizeAccountName, scoreAccountMatch } from './lib/accountMatch'
-import { effectsDelta, transactionEffects } from './lib/transactions'
+import { accountDeletionReversals, effectsDelta, transactionEffects } from './lib/transactions'
 import { advanceRecurringDate, isValidFrequency, isValidRecurringDate } from './lib/recurring'
 
 interface Env {
@@ -319,15 +319,18 @@ async function handle(request: Request, env: Env): Promise<Response> {
     return result.meta.changes ? json({ ok: true }) : fail('ไม่พบบัญชี', 404)
   }
   if (accountMatch && method === 'DELETE') {
-    const rows = await env.DB.prepare('SELECT image_key FROM transactions WHERE (account_id = ? OR transfer_account_id = ?) AND user_id = ?').bind(accountMatch[1], accountMatch[1], user.id).all<{ image_key: string | null }>()
+    const rows = await env.DB.prepare('SELECT id, type, amount, account_id, transfer_account_id, image_key FROM transactions WHERE (account_id = ? OR transfer_account_id = ?) AND user_id = ?').bind(accountMatch[1], accountMatch[1], user.id).all<{ id: string; type: string; amount: number; account_id: string; transfer_account_id: string | null; image_key: string | null }>()
+    const reversals = accountDeletionReversals(accountMatch[1], rows.results)
     const batch = await env.DB.batch([
+      ...reversals.map((effect) => env.DB.prepare('UPDATE accounts SET balance = balance + ? WHERE id = ? AND user_id = ?').bind(effect.delta, effect.account_id, user.id)),
       env.DB.prepare('DELETE FROM transactions WHERE (account_id = ? OR transfer_account_id = ?) AND user_id = ?').bind(accountMatch[1], accountMatch[1], user.id),
       env.DB.prepare('DELETE FROM accounts WHERE id = ? AND user_id = ?').bind(accountMatch[1], user.id),
     ])
     if (env.RECEIPTS) {
       for (const row of rows.results) if (row.image_key) await env.RECEIPTS.delete(row.image_key)
     }
-    return batch[1]?.meta.changes ? json({ ok: true }) : fail('ไม่พบบัญชี', 404)
+    const accountDeleteResult = batch[batch.length - 1]
+    return accountDeleteResult?.meta.changes ? json({ ok: true }) : fail('ไม่พบบัญชี', 404)
   }
 
   if (path === '/api/transactions' && method === 'GET') {

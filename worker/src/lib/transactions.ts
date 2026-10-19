@@ -33,3 +33,20 @@ export function effectsDelta(before: BalanceEffect[], after: BalanceEffect[]): B
     .filter(([, delta]) => delta !== 0)
     .map(([account_id, delta]) => ({ account_id, delta }))
 }
+
+// When an account is deleted, all its transactions are also removed.
+// Any transaction that touched another account (such as a cross-account transfer)
+// must have its effect reverted on that other account.
+export function accountDeletionReversals(accountIdToDelete: string, transactions: TransactionLike[]): BalanceEffect[] {
+  const net = new Map<string, number>()
+  for (const tx of transactions) {
+    for (const { account_id, delta } of transactionEffects(tx)) {
+      if (account_id !== accountIdToDelete) {
+        net.set(account_id, (net.get(account_id) || 0) - delta)
+      }
+    }
+  }
+  return [...net.entries()]
+    .filter(([, delta]) => delta !== 0)
+    .map(([account_id, delta]) => ({ account_id, delta }))
+}

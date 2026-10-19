@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { effectsDelta, transactionEffects } from '../src/lib/transactions'
+import { accountDeletionReversals, effectsDelta, transactionEffects } from '../src/lib/transactions'
 
 describe('transactionEffects', () => {
   it('income and expense affect a single account', () => {
@@ -85,5 +85,46 @@ describe('effectsDelta', () => {
       transactionEffects({ type: 'transfer', amount: 2500, account_id: 'a1', transfer_account_id: 'a1' }),
       transactionEffects({ type: 'expense', amount: 0, account_id: 'a1' }),
     )).toEqual([])
+  })
+})
+
+describe('accountDeletionReversals', () => {
+  it('reverts transfer destination balance when source account is deleted (A -> B, delete A)', () => {
+    // 100 THB transferred from A to B: B gained 10000 satang (+10000)
+    // Deleting A must revert B by -10000
+    const tx = { type: 'transfer', amount: 10000, account_id: 'A', transfer_account_id: 'B' }
+    expect(accountDeletionReversals('A', [tx])).toEqual([
+      { account_id: 'B', delta: -10000 },
+    ])
+  })
+
+  it('reverts transfer source balance when destination account is deleted (B -> A, delete A)', () => {
+    // 100 THB transferred from B to A: B lost 10000 satang (-10000)
+    // Deleting A must revert B by +10000
+    const tx = { type: 'transfer', amount: 10000, account_id: 'B', transfer_account_id: 'A' }
+    expect(accountDeletionReversals('A', [tx])).toEqual([
+      { account_id: 'B', delta: 10000 },
+    ])
+  })
+
+  it('income and expense in deleted account do not affect other accounts', () => {
+    const txs = [
+      { type: 'income', amount: 50000, account_id: 'A' },
+      { type: 'expense', amount: 20000, account_id: 'A' },
+    ]
+    expect(accountDeletionReversals('A', txs)).toEqual([])
+  })
+
+  it('handles multiple transfers across multiple accounts', () => {
+    const txs = [
+      { type: 'transfer', amount: 10000, account_id: 'A', transfer_account_id: 'B' }, // B: -10000
+      { type: 'transfer', amount: 4000, account_id: 'B', transfer_account_id: 'A' },  // B: +4000 (net B: -6000)
+      { type: 'transfer', amount: 20000, account_id: 'A', transfer_account_id: 'C' }, // C: -20000
+      { type: 'income', amount: 5000, account_id: 'A' },
+    ]
+    expect(accountDeletionReversals('A', txs)).toEqual([
+      { account_id: 'B', delta: -6000 },
+      { account_id: 'C', delta: -20000 },
+    ])
   })
 })
