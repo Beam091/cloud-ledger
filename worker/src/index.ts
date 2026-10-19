@@ -1,6 +1,6 @@
 import { connect } from 'cloudflare:sockets'
 import { base64url, decoder, encoder, fromBase64 } from './lib/encoding'
-import { toBaht, toSatang } from './lib/money'
+import { sumBalances, toBaht, toSatang } from './lib/money'
 import { dateInTz, tzOffsetMinutes } from './lib/timezone'
 import { cronMatches } from './lib/cron'
 import { tokenFor } from './lib/credentials'
@@ -294,7 +294,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
       trend: trend.results.map((row) => ({ day: row.day, total: toBaht(row.total) })),
       budgets: budgets.map((row) => ({ category: row.category, limit: toBaht(row.budget_satang), spent: toBaht(row.spent_satang) })),
       period,
-      balance: accounts.results.reduce((sum, account) => sum + toBaht(account.balance), 0),
+      balance: sumBalances(accounts.results),
     })
   }
 
