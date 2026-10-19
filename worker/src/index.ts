@@ -4,7 +4,8 @@ import { sumBalances, toBaht, toSatang } from './lib/money'
 import { dateInTz, tzOffsetMinutes } from './lib/timezone'
 import { cronMatches } from './lib/cron'
 import { tokenFor } from './lib/credentials'
-import { decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, verifyResetCode } from './lib/credentials'
+import { DUMMY_PASSWORD_HASH, decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, verifyResetCode } from './lib/credentials'
+import { RATE_LIMITS, checkRateLimit, getClientIp } from './lib/rateLimit'
 import { accountAliasVariants, normalizeAccountName, scoreAccountMatch } from './lib/accountMatch'
 import {
   MAX_AMOUNT_BAHT,
@@ -201,6 +202,18 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const input = await body<{ email: string; password: string }>(request)
     const email = input.email?.trim().toLowerCase()
     if (!email || !/^\S+@\S+\.\S+$/.test(email) || !input.password || input.password.length < 8) return fail('กรุณากรอกอีเมลและรหัสผ่านอย่างน้อย 8 ตัวอักษร')
+
+    const clientIp = getClientIp(request)
+    const regRate = await checkRateLimit(env.DB, `register:${clientIp}`, RATE_LIMITS.REGISTER.limit, RATE_LIMITS.REGISTER.windowSeconds)
+    if (!regRate.allowed) return fail('คุณสมัครสมาชิกบ่อยเกินไป กรุณารอสักครู่', 429)
+
+    const hasUsers = await env.DB.prepare('SELECT 1 FROM users LIMIT 1').first()
+    if (hasUsers) {
+      const regSetting = await env.DB.prepare("SELECT value FROM system_settings WHERE key = 'registration_open'").first<{ value: string }>()
+      const registrationOpen = regSetting ? regSetting.value !== '0' : true
+      if (!registrationOpen) return fail('ระบบปิดรับการลงทะเบียนชั่วคราว', 403)
+    }
+
     if (await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first()) return fail('อีเมลนี้ถูกใช้งานแล้ว', 409)
     const newId = id()
     try {
@@ -220,6 +233,11 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const input = await body<{ email: string }>(request)
     const email = input.email?.trim().toLowerCase()
     if (!email || !/^\S+@\S+\.\S+$/.test(email)) return fail('กรุณากรอกอีเมลให้ถูกต้อง')
+
+    const clientIp = getClientIp(request)
+    const rate = await checkRateLimit(env.DB, `forgot_password:${clientIp}:${email}`, RATE_LIMITS.PASSWORD_RESET.limit, RATE_LIMITS.PASSWORD_RESET.windowSeconds)
+    if (!rate.allowed) return fail('คุณขอรีเซ็ตรหัสผ่านบ่อยเกินไป กรุณารอสักครู่', 429)
+
     const config = await settings(env)
     if (!config.smtp_from_email || !config.smtp_app_password_encrypted) return fail('ระบบยังไม่ได้ตั้งค่าอีเมลส่ง OTP กรุณาติดต่อผู้ดูแลระบบ', 503)
     const generic = { message: 'หากอีเมลนี้มีบัญชีอยู่ ระบบจะส่งรหัส OTP ให้ภายในไม่กี่นาที' }
@@ -244,6 +262,11 @@ async function handle(request: Request, env: Env): Promise<Response> {
     const input = await body<{ email: string; code: string; password: string }>(request)
     const email = input.email?.trim().toLowerCase()
     if (!email || !/^\S+@\S+\.\S+$/.test(email) || !/^\d{6}$/.test(input.code || '') || !input.password || input.password.length < 8) return fail('กรุณาตรวจสอบอีเมล, OTP 6 หลัก และรหัสผ่านอย่างน้อย 8 ตัวอักษร')
+
+    const clientIp = getClientIp(request)
+    const rate = await checkRateLimit(env.DB, `reset_password:${clientIp}:${email}`, RATE_LIMITS.PASSWORD_RESET.limit, RATE_LIMITS.PASSWORD_RESET.windowSeconds)
+    if (!rate.allowed) return fail('คุณดำเนินการบ่อยเกินไป กรุณารอสักครู่', 429)
+
     const user = await env.DB.prepare('SELECT id FROM users WHERE email = ? AND is_active = 1').bind(email).first<{ id: string }>()
     if (!user) return fail('OTP ไม่ถูกต้องหรือหมดอายุ', 400)
     const reset = await env.DB.prepare("SELECT id, code_hash FROM password_reset_otps WHERE user_id = ? AND used_at IS NULL AND attempts < 5 AND expires_at > CURRENT_TIMESTAMP ORDER BY created_at DESC LIMIT 1").bind(user.id).first<{ id: string; code_hash: string }>()
@@ -261,9 +284,16 @@ async function handle(request: Request, env: Env): Promise<Response> {
   }
 
   if (path === '/api/auth/login' && method === 'POST') {
-    const input = await body<{ email: string; password: string }>(request)
-    const row = await env.DB.prepare('SELECT id, email, role, password_hash, is_active, token_version FROM users WHERE email = ?').bind(input.email?.trim().toLowerCase() || '').first<UserRow & { token_version: number }>()
-    if (!row || !(await passwordMatches(input.password || '', row.password_hash))) return fail('อีเมลหรือรหัสผ่านไม่ถูกต้อง', 401)
+    const input = await body<{ email?: string; password?: string }>(request)
+    const email = input.email?.trim().toLowerCase() || ''
+    const clientIp = getClientIp(request)
+    const rate = await checkRateLimit(env.DB, `login:${clientIp}:${email}`, RATE_LIMITS.LOGIN.limit, RATE_LIMITS.LOGIN.windowSeconds)
+    if (!rate.allowed) return fail('คุณพยายามเข้าสู่ระบบบ่อยเกินไป กรุณารอสักครู่', 429)
+
+    const row = await env.DB.prepare('SELECT id, email, role, password_hash, is_active, token_version FROM users WHERE email = ?').bind(email).first<UserRow & { token_version: number }>()
+    const targetHash = row ? row.password_hash : DUMMY_PASSWORD_HASH
+    const matches = await passwordMatches(input.password || '', targetHash)
+    if (!row || !matches) return fail('อีเมลหรือรหัสผ่านไม่ถูกต้อง', 401)
     if (!row.is_active) return fail('บัญชีนี้ถูกปิดใช้งาน กรุณาติดต่อผู้ดูแล', 403)
     return sessionResponse(request, env, { id: row.id, email: row.email, role: row.role }, row.token_version)
   }
@@ -504,6 +534,11 @@ async function handle(request: Request, env: Env): Promise<Response> {
     return new Response(JSON.stringify(payload, null, 2), { headers: { 'content-type': 'application/json; charset=utf-8', 'content-disposition': `attachment; filename="ledgerly-backup-${stamp}.json"` } })
   }
 
+  if (path.startsWith('/api/ai/')) {
+    const rate = await checkRateLimit(env.DB, `ai:${user.id}`, RATE_LIMITS.AI.limit, RATE_LIMITS.AI.windowSeconds)
+    if (!rate.allowed) return fail('คุณใช้งาน AI เกินโควตาที่กำหนด (30 ครั้ง/ชั่วโมง) กรุณารอสักครู่', 429)
+  }
+
   if (path === '/api/ai/parse' && method === 'POST') {
     const input = await body<{ text: string }>(request)
     if (!input.text?.trim()) return fail('กรุณาพิมพ์รายละเอียดรายการ')
@@ -661,14 +696,19 @@ async function handle(request: Request, env: Env): Promise<Response> {
     }
     if (path === '/api/admin/settings' && method === 'PUT') {
       const input = await body<Record<string, string>>(request)
-      const allowed = ['ai_provider', 'ai_base_url', 'ai_model', 'ai_api_key', 'image_retention_policy', 'image_retention_days']
+      const allowed = ['ai_provider', 'ai_base_url', 'ai_model', 'ai_api_key', 'image_retention_policy', 'image_retention_days', 'registration_open']
       if (input.image_retention_policy && !['full', 'auto_cleanup', 'data_only'].includes(input.image_retention_policy)) return fail('นโยบายรูปภาพไม่ถูกต้อง')
       let aiBaseUrl: string | undefined
       if (input.ai_base_url !== undefined) {
         try { aiBaseUrl = normalizedAiBaseUrl(input.ai_base_url) }
         catch (error) { return fail(error instanceof Error ? error.message : 'AI base URL ไม่ถูกต้อง') }
       }
-      for (const key of allowed) if (input[key] !== undefined) await env.DB.prepare('INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP').bind(key, key === 'ai_base_url' ? aiBaseUrl : input[key]).run()
+      for (const key of allowed) {
+        if (input[key] !== undefined) {
+          const val = key === 'ai_base_url' ? aiBaseUrl : (key === 'registration_open' ? (input[key] === '0' || input[key] === 'false' ? '0' : '1') : input[key])
+          await env.DB.prepare('INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP').bind(key, val).run()
+        }
+      }
       if (input.smtp_from_email !== undefined) {
         if (input.smtp_from_email && !/^\S+@\S+\.\S+$/.test(input.smtp_from_email)) return fail('อีเมลสำหรับส่ง OTP ไม่ถูกต้อง')
         await env.DB.prepare('INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP').bind('smtp_from_email', input.smtp_from_email.trim().toLowerCase()).run()

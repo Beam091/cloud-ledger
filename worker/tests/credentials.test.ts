@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
-import { decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, tokenFor, verifyResetCode } from '../src/lib/credentials'
+import { DUMMY_PASSWORD_HASH, decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, timingSafeEqual, tokenFor, verifyResetCode } from '../src/lib/credentials'
 
 // base64 of 32 arbitrary bytes
 const SECRET = 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY='
@@ -80,5 +80,31 @@ describe('reset code digest', () => {
     expect(await verifyResetCode(userId, '123456', digest, SECRET)).toBe(true)
     expect(await verifyResetCode(userId, '654321', digest, SECRET)).toBe(false)
     expect(await verifyResetCode(randomUUID(), '123456', digest, SECRET)).toBe(false)
+  })
+})
+
+describe('timingSafeEqual', () => {
+  it('returns true for matching Uint8Arrays', () => {
+    const a = new Uint8Array([1, 2, 3, 4])
+    const b = new Uint8Array([1, 2, 3, 4])
+    expect(timingSafeEqual(a, b)).toBe(true)
+  })
+
+  it('returns false for mismatched Uint8Arrays of same length', () => {
+    const a = new Uint8Array([1, 2, 3, 4])
+    const b = new Uint8Array([1, 2, 3, 5])
+    expect(timingSafeEqual(a, b)).toBe(false)
+  })
+
+  it('returns false for Uint8Arrays of different lengths', () => {
+    const a = new Uint8Array([1, 2, 3])
+    const b = new Uint8Array([1, 2, 3, 4])
+    expect(timingSafeEqual(a, b)).toBe(false)
+  })
+})
+
+describe('dummy password comparison', () => {
+  it('safely evaluates dummy password hash without matching any password', async () => {
+    expect(await passwordMatches('any-password-here', DUMMY_PASSWORD_HASH)).toBe(false)
   })
 })
