@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { cronMatches } from '../src/lib/cron'
+import { cronMatches, isDueInLookbackWindow } from '../src/lib/cron'
 
 const bangkok = (iso: string) => new Date(iso)
 
@@ -63,3 +63,61 @@ describe('cronMatches', () => {
     expect(cronMatches('0 21 * * *', bangkok('2026-10-18T14:00:00Z'), '')).toBe(true)
   })
 })
+
+describe('isDueInLookbackWindow', () => {
+  const expr = '0 21 * * *' // 21:00 daily
+
+  it('triggers when called exactly at scheduled time', () => {
+    // 21:00 Asia/Bangkok is 14:00 UTC
+    const now = new Date('2026-10-18T14:00:00Z')
+    const result = isDueInLookbackWindow(expr, now, 'Asia/Bangkok', null, 15)
+    expect(result.due).toBe(true)
+    expect(result.slotIso).toBe(new Date('2026-10-18T14:00:00.000Z').toISOString())
+  })
+
+  it('triggers when called 10 minutes late (catch-up within 15-minute lookback window)', () => {
+    const now = new Date('2026-10-18T14:10:00Z')
+    const result = isDueInLookbackWindow(expr, now, 'Asia/Bangkok', null, 15)
+    expect(result.due).toBe(true)
+    expect(result.slotIso).toBe(new Date('2026-10-18T14:00:00.000Z').toISOString())
+  })
+
+  it('does not trigger when called after the lookback window (e.g. 16 minutes late)', () => {
+    const now = new Date('2026-10-18T14:16:00Z')
+    const result = isDueInLookbackWindow(expr, now, 'Asia/Bangkok', null, 15)
+    expect(result.due).toBe(false)
+  })
+
+  it('does not trigger if already sent for the matching slot (deduplication with last_sent_at)', () => {
+    // Exactly at scheduled time
+    const slotIso = new Date('2026-10-18T14:00:00.000Z').toISOString()
+    const now = new Date('2026-10-18T14:05:00Z')
+    const result = isDueInLookbackWindow(expr, now, 'Asia/Bangkok', slotIso, 15)
+    expect(result.due).toBe(false)
+  })
+
+  it('triggers on next day when last_sent_at is from previous day', () => {
+    const yesterdaySlot = new Date('2026-10-17T14:00:00.000Z').toISOString()
+    const now = new Date('2026-10-18T14:05:00Z')
+    const result = isDueInLookbackWindow(expr, now, 'Asia/Bangkok', yesterdaySlot, 15)
+    expect(result.due).toBe(true)
+    expect(result.slotIso).toBe(new Date('2026-10-18T14:00:00.000Z').toISOString())
+  })
+
+  it('supports half-hour offset timezones such as Asia/Kolkata (+05:30)', () => {
+    // 21:00 in Asia/Kolkata (+05:30) is 15:30 UTC
+    const exactNow = new Date('2026-10-18T15:30:00Z')
+    expect(isDueInLookbackWindow(expr, exactNow, 'Asia/Kolkata', null, 15)).toEqual({
+      due: true,
+      slotIso: new Date('2026-10-18T15:30:00.000Z').toISOString(),
+    })
+
+    // Catch-up 12 minutes later
+    const catchupNow = new Date('2026-10-18T15:42:00Z')
+    expect(isDueInLookbackWindow(expr, catchupNow, 'Asia/Kolkata', null, 15)).toEqual({
+      due: true,
+      slotIso: new Date('2026-10-18T15:30:00.000Z').toISOString(),
+    })
+  })
+})
+

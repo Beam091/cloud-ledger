@@ -35,3 +35,38 @@ export function cronMatches(expression: string, date: Date, timezone: string) {
   const dateMatches = fields[2] === '*' || fields[4] === '*' ? dayMatches && weekdayMatches : dayMatches || weekdayMatches
   return cronFieldMatches(fields[0], minute, 0, 59) && cronFieldMatches(fields[1], hour, 0, 23) && dateMatches && cronFieldMatches(fields[3], month, 1, 12)
 }
+
+/**
+ * Checks if a cron expression was due within a lookback window [now - windowMinutes, now]
+ * and hasn't already been sent for the matching slot.
+ *
+ * Checks minute-by-minute (or minute steps) within the window.
+ * Returns the latest matching ISO timestamp string (at minute resolution) if due, or null.
+ */
+export function isDueInLookbackWindow(
+  expression: string,
+  now: Date,
+  timezone: string,
+  lastSentAt?: string | null,
+  windowMinutes = 15
+): { due: boolean; slotIso?: string } {
+  // Truncate now to minute boundary (seconds & ms = 0)
+  const currentMinuteMs = Math.floor(now.getTime() / 60000) * 60000
+  const lastSentTime = lastSentAt ? new Date(lastSentAt).getTime() : 0
+
+  // Walk backwards from now down to now - windowMinutes
+  for (let offset = 0; offset <= windowMinutes; offset++) {
+    const candidateTime = currentMinuteMs - offset * 60000
+    const candidateDate = new Date(candidateTime)
+    if (cronMatches(expression, candidateDate, timezone)) {
+      // If candidate was already sent (lastSentTime >= candidateTime), it has been processed
+      if (lastSentTime >= candidateTime) {
+        return { due: false }
+      }
+      return { due: true, slotIso: new Date(candidateTime).toISOString() }
+    }
+  }
+
+  return { due: false }
+}
+

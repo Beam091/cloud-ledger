@@ -2,7 +2,7 @@ import { connect } from 'cloudflare:sockets'
 import { base64url, decoder, encoder, fromBase64 } from './lib/encoding'
 import { sumBalances, toBaht, toSatang } from './lib/money'
 import { dateInTz, tzOffsetMinutes } from './lib/timezone'
-import { cronMatches } from './lib/cron'
+import { cronMatches, isDueInLookbackWindow } from './lib/cron'
 import { tokenFor } from './lib/credentials'
 import { DUMMY_PASSWORD_HASH, decrypt, encrypt, maybeDecrypt, passwordHash, passwordMatches, resetCodeDigest, verifyResetCode } from './lib/credentials'
 import { RATE_LIMITS, checkRateLimit, getClientIp } from './lib/rateLimit'
@@ -37,7 +37,7 @@ interface UploadedFile { type: string; size: number; name: string; stream(): Rea
 interface UserRow extends AuthUser { password_hash: string; is_active: number }
 interface AccountRow { id: string; user_id: string; name: string; type: string; balance: number; currency: string }
 interface TransactionRow { id: string; user_id: string; account_id: string; transfer_account_id: string | null; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string | null; image_url: string | null; image_key: string | null; transaction_date: string }
-interface NotificationRow { user_id: string; gmail_enabled: number; gmail_address: string | null; gmail_app_password_encrypted: string | null; telegram_enabled: number; telegram_bot_token: string | null; telegram_chat_id: string | null; discord_enabled: number; discord_webhook_url: string | null; cron_schedule: string; timezone: string; user_email?: string | null }
+interface NotificationRow { user_id: string; gmail_enabled: number; gmail_address: string | null; gmail_app_password_encrypted: string | null; telegram_enabled: number; telegram_bot_token: string | null; telegram_chat_id: string | null; discord_enabled: number; discord_webhook_url: string | null; cron_schedule: string; timezone: string; last_sent_at?: string | null; user_email?: string | null }
 interface RecurringRow { id: string; user_id: string; account_id: string; transfer_account_id: string | null; type: 'income' | 'expense' | 'transfer'; amount: number; category: string; description: string; frequency: 'daily' | 'weekly' | 'monthly'; next_run_date: string; anchor_day?: number | null; is_active: number }
 interface BudgetRow { id: string; user_id: string; category: string; amount: number }
 
@@ -880,7 +880,13 @@ async function runScheduled(env: Env) {
   await materializeRecurring(env)
   const users = await env.DB.prepare('SELECT n.*, u.email AS user_email FROM user_notification_settings n JOIN users u ON u.id = n.user_id WHERE u.is_active = 1 AND (n.gmail_enabled = 1 OR n.telegram_enabled = 1 OR n.discord_enabled = 1)').all<NotificationRow>()
   const now = new Date()
-  await Promise.allSettled(users.results.filter((row) => cronMatches(row.cron_schedule, now, row.timezone)).map((row) => dispatchNotification(env, row)))
+  for (const row of users.results) {
+    const check = isDueInLookbackWindow(row.cron_schedule, now, row.timezone, row.last_sent_at)
+    if (check.due && check.slotIso) {
+      await dispatchNotification(env, row)
+      await env.DB.prepare('UPDATE user_notification_settings SET last_sent_at = ? WHERE user_id = ?').bind(check.slotIso, row.user_id).run()
+    }
+  }
   const config = await settings(env)
   if (config.image_retention_policy === 'auto_cleanup' && env.RECEIPTS) {
     const days = Math.max(1, Number(config.image_retention_days || 90))
