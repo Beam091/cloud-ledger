@@ -360,8 +360,15 @@ async function handle(request: Request, env: Env): Promise<Response> {
   }
   const accountMatch = path.match(/^\/api\/accounts\/([^/]+)$/)
   if (accountMatch && method === 'PATCH') {
-    const input = await body<{ name?: string; type?: string }>(request)
+    const input = await body<{ name?: string; type?: string; balance?: number }>(request)
     if (!isValidAccountName(input.name) || !isValidAccountType(input.type)) return fail('ข้อมูลบัญชีไม่ถูกต้อง')
+    const hasBalance = input.balance !== undefined && input.balance !== null
+    if (hasBalance) {
+      const balanceNum = Number(input.balance)
+      if (!Number.isFinite(balanceNum) || Math.abs(balanceNum) > MAX_AMOUNT_BAHT) return fail('ยอดเงินคงเหลือไม่ถูกต้อง')
+      const result = await env.DB.prepare('UPDATE accounts SET name = ?, type = ?, balance = ? WHERE id = ? AND user_id = ?').bind(input.name.trim(), input.type, toSatang(balanceNum), accountMatch[1], user.id).run()
+      return result.meta.changes ? json({ ok: true }) : fail('ไม่พบบัญชี', 404)
+    }
     const result = await env.DB.prepare('UPDATE accounts SET name = ?, type = ? WHERE id = ? AND user_id = ?').bind(input.name.trim(), input.type, accountMatch[1], user.id).run()
     return result.meta.changes ? json({ ok: true }) : fail('ไม่พบบัญชี', 404)
   }
@@ -574,8 +581,10 @@ async function handle(request: Request, env: Env): Promise<Response> {
   }
 
   if (path.startsWith('/api/ai/')) {
-    const rate = await checkRateLimit(env.DB, `ai:${user.id}`, RATE_LIMITS.AI.limit, RATE_LIMITS.AI.windowSeconds)
-    if (!rate.allowed) return fail('คุณใช้งาน AI เกินโควตาที่กำหนด (30 ครั้ง/ชั่วโมง) กรุณารอสักครู่', 429)
+    if (user.role !== 'admin') {
+      const rate = await checkRateLimit(env.DB, `ai:${user.id}`, RATE_LIMITS.AI.limit, RATE_LIMITS.AI.windowSeconds)
+      if (!rate.allowed) return fail('คุณใช้งาน AI เกินโควตาที่กำหนด (30 ครั้ง/ชั่วโมง) กรุณารอสักครู่', 429)
+    }
   }
 
   if (path === '/api/ai/parse' && method === 'POST') {
