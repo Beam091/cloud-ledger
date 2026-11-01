@@ -270,7 +270,19 @@ function App() {
           </div>
         </header>
 
-        {page === 'overview' && <Overview dashboard={dashboard} period={overviewPeriod} onPeriodChange={(period) => { setOverviewPeriod(period); window.location.hash = `#/overview/${period}` }} onAdd={startTransaction} onNavigate={navigate} onBudgetAdd={startBudget} onBudgetEdit={(budget) => { setEditingBudget({ category: budget.category, amount: budget.limit }); setDialog('budget') }} onBudgetDelete={deleteBudget} />}
+        {page === 'overview' && (
+          <Overview
+            dashboard={dashboard}
+            period={overviewPeriod}
+            onPeriodChange={(period) => { setOverviewPeriod(period); window.location.hash = `#/overview/${period}` }}
+            onAdd={startTransaction}
+            onNavigate={navigate}
+            onBudgetAdd={startBudget}
+            onBudgetEdit={(budget) => { setEditingBudget({ category: budget.category, amount: budget.limit }); setDialog('budget') }}
+            onBudgetDelete={deleteBudget}
+            onAccountEdit={startAccount}
+          />
+        )}
         {page === 'transactions' && (
           <TransactionsPage
             transactions={allTransactions}

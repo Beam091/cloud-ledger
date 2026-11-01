@@ -164,4 +164,61 @@ describe('Worker Integration Tests', () => {
     }
     expect(lastStatus).toBe(429)
   })
+
+  it('allows admin to bypass AI rate limit and allows editing account balance directly', async () => {
+    const admin = await createUser('admin_ai_bypass@test.com', 'admin')
+    const normalUser = await createUser('user_ai_limited@test.com', 'user')
+
+    // 1. Account balance editing directly
+    const accRes = await SELF.fetch('https://money.aury.win/api/accounts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: admin.cookie },
+      body: JSON.stringify({ name: 'Editable Bank', type: 'bank', balance: 100 }),
+    })
+    expect(accRes.status).toBe(201)
+    const accData = (await accRes.json()) as { id: string; balance: number }
+    expect(accData.balance).toBe(100)
+
+    // Edit balance to 2500.50 via PATCH
+    const patchRes = await SELF.fetch(`https://money.aury.win/api/accounts/${accData.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Cookie: admin.cookie },
+      body: JSON.stringify({ name: 'Editable Bank Updated', type: 'bank', balance: 2500.5 }),
+    })
+    expect(patchRes.status).toBe(200)
+
+    // Verify updated account balance
+    const listRes = await SELF.fetch('https://money.aury.win/api/accounts', {
+      headers: { Cookie: admin.cookie },
+    })
+    const listData = (await listRes.json()) as { results: Array<{ id: string; balance: number; name: string }> }
+    const updatedAcc = listData.results.find((a) => a.id === accData.id)
+    expect(updatedAcc?.balance).toBe(2500.5)
+    expect(updatedAcc?.name).toBe('Editable Bank Updated')
+
+    // 2. AI rate limit bypass for admin
+    // Insert dummy rate limit row for both normalUser and admin to simulate exhausted AI quota (30/30)
+    const now = Math.floor(Date.now() / 1000)
+    await env.DB.prepare('INSERT INTO rate_limits (key, window_start, count) VALUES (?, ?, ?), (?, ?, ?)')
+      .bind(`ai:${normalUser.id}`, now, 35, `ai:${admin.id}`, now, 35)
+      .run()
+
+    // Normal user hits /api/ai/parse -> should get 429
+    const userAiRes = await SELF.fetch('https://money.aury.win/api/ai/parse', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: normalUser.cookie },
+      body: JSON.stringify({ text: 'ข้าวเที่ยง 50 บาท' }),
+    })
+    expect(userAiRes.status).toBe(429)
+
+    // Admin user hits /api/ai/parse -> should bypass 429 rate limit (will proceed to parse logic, not 429)
+    const adminAiRes = await SELF.fetch('https://money.aury.win/api/ai/parse', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: admin.cookie },
+      body: JSON.stringify({ text: '' }), // empty text returns 400 'กรุณาพิมพ์รายละเอียดรายการ', showing it bypassed 429
+    })
+    expect(adminAiRes.status).toBe(400)
+    const adminErr = (await adminAiRes.json()) as { error: string }
+    expect(adminErr.error).toBe('กรุณาพิมพ์รายละเอียดรายการ')
+  })
 })
